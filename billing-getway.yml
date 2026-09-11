@@ -1,0 +1,136 @@
+# Internal billing gateway (autofik.dev.api.billing.getway.internal) on the
+# RKE2 cluster provisioned by api/ansible.
+#
+# The pod serves two listeners from one binary:
+#   :8081  REST/JSON, transcoded to gRPC by grpc-gateway - this is what the
+#          external APISIX gateway proxies /mobile/v1/* to (see apisix/).
+#   :50055 gRPC, for other in-cluster services that call BillingGatewayService
+#          directly (e.g. the subscription service resolving a caller's
+#          identity through VerifyToken).
+#
+# Neither listener is exposed by an Ingress on purpose: everything from the
+# outside must come in through APISIX, which is the only edge for this API.
+#
+# Apply with `make deploy` (or kubectl apply -k .) - see README.md.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: billing-getway-internal
+  namespace: default
+  labels:
+    app: billing-getway-internal
+data:
+  # Listen addresses. Keep these in sync with the container/Service ports
+  # below and with the upstream port in apisix/seed-routes.sh.
+  GRPC_LISTEN_ADDR: ":50055"
+  GATEWAY_LISTEN_ADDR: ":8081"
+
+  # Downstream REST services this gateway proxies to. These are in-cluster
+  # Service DNS names - change them to whatever the billing / subscription /
+  # user-auth-sso Services are actually called in this namespace, or to an
+  # external URL if a service still runs outside the cluster.
+  BILLING_SERVICE_URL: "http://billing.default.svc.cluster.local:4041"
+  SUBSCRIPTION_SERVICE_URL: "http://subscription.default.svc.cluster.local:4040"
+  USER_SERVICE_URL: "http://user-auth-sso.default.svc.cluster.local:4000"
+
+  # GET route on the user service that returns verify-token records. The
+  # UserServiceVerifier appends this to USER_SERVICE_URL on every request.
+  VERIFY_TOKEN_ENDPOINT: "/api/user/verify-token"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: billing-getway-internal
+  namespace: default
+  labels:
+    app: billing-getway-internal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: billing-getway-internal
+  template:
+    metadata:
+      labels:
+        app: billing-getway-internal
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        # 65532 = the "nonroot" user baked into the distroless base image the
+        # Dockerfile builds on. The binary writes nothing to disk and binds
+        # only high ports, so it needs no privileges at all.
+        runAsUser: 65532
+        runAsGroup: 65532
+      containers:
+        - name: billing-getway-internal
+          # Pushed by the repo's master.yml workflow: dev-v* tags publish
+          # :dev-<version> and re-tag it :master. Pin :dev-<version> for a
+          # reproducible rollout; :master + Always is the moving dev target.
+          image: autofikbyslaap/dev.api.billing.getway:master
+          imagePullPolicy: Always
+          ports:
+            - name: grpc
+              containerPort: 50055
+            - name: http-gw
+              containerPort: 8081
+          envFrom:
+            - configMapRef:
+                name: billing-getway-internal
+            - secretRef:
+                name: billing-getway-internal
+          # /healty (sic - that is the route the binary serves) is mounted
+          # ahead of the grpc-gateway mux, so it never enters the gRPC
+          # interceptor chain and needs no bearer token.
+          startupProbe:
+            httpGet:
+              path: /healty
+              port: http-gw
+            periodSeconds: 3
+            failureThreshold: 20
+          readinessProbe:
+            httpGet:
+              path: /healty
+              port: http-gw
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healty
+              port: http-gw
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: billing-getway-internal
+  namespace: default
+  labels:
+    app: billing-getway-internal
+spec:
+  type: ClusterIP
+  selector:
+    app: billing-getway-internal
+  ports:
+    - name: http-gw
+      protocol: TCP
+      port: 8081
+      targetPort: http-gw
+    - name: grpc
+      protocol: TCP
+      port: 50055
+      targetPort: grpc
