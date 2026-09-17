@@ -1,8 +1,19 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# secret.yml is deliberately not listed - it holds real API keys, is
-# gitignored, and is applied separately (make secret). Everything here is
-# safe to commit.
+# The Secrets these workloads read are NOT here: they are generated from the
+# cluster's own datastore Secrets plus each service repo's .env by
+# scripts/build-secrets.sh (make secrets), so no credential is ever written
+# into this repo.
+#
+# There is no rabbitmq manifest either - this cluster already runs a broker at
+# rabbitmq.rabbitmq.svc.cluster.local:5672, which is what the billing and
+# subscription services are pointed at.
+#
+# Order does not matter to kustomize; listed dependency-first for readers.
 resources:
+  - sso-db-init.yml
+  - sso.yml
+  - billing.yml
+  - subscription.yml
   - billing-getway.yml

@@ -1,0 +1,84 @@
+# Creates the `sso` database the identity service connects to.
+#
+# It runs in the `postgres` namespace, not `default`, so it can reference the
+# postgres-admin Secret that already lives there - no credential is copied
+# anywhere to bootstrap the database.
+#
+# TypeORM creates the *tables* (synchronize) but never the database itself, so
+# without this the sso pod crash-loops on "database \"sso\" does not exist".
+# The job is idempotent: re-running it on an existing database is a no-op, so
+# it is safe to leave in the kustomization and re-apply on every deploy.
+#
+# A completed Job is immutable - `kubectl apply` over one that already ran
+# fails on the changed selector. `make deploy` deletes it first; to run it by
+# hand:
+#
+#   kubectl -n postgres delete job sso-db-init --ignore-not-found
+#   kubectl apply -f sso-db-init.yml
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sso-db-init
+  namespace: postgres
+  labels:
+    app: sso
+spec:
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        app: sso
+        job: sso-db-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: createdb
+          # Same image as the server it talks to, so psql/createdb can never
+          # be a version behind the cluster.
+          image: postgres:16-alpine
+          env:
+            - name: PGHOST
+              value: postgres.postgres.svc.cluster.local
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-admin
+                  key: username
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-admin
+                  key: password
+            - name: PGDATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-admin
+                  key: database
+            - name: TARGET_DB
+              value: sso
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              # Wait for the server rather than failing the Job on a cold start.
+              for i in $(seq 1 30); do
+                pg_isready -q && break
+                echo "waiting for postgres ($i/30)"
+                sleep 2
+              done
+              if [ "$(psql -tAc "SELECT 1 FROM pg_database WHERE datname='${TARGET_DB}'")" = "1" ]; then
+                echo "database ${TARGET_DB} already exists"
+              else
+                createdb "${TARGET_DB}"
+                echo "created database ${TARGET_DB}"
+              fi
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi

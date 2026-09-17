@@ -1,0 +1,166 @@
+# autofik.dev.api.billing - billing records, payment evidence, approvals.
+#
+# Internal only: no APISIX route and no Ingress. The only thing that calls it
+# is the billing gateway, over the ClusterIP Service below. Exposing it
+# directly would bypass the gateway's token verification entirely.
+#
+# Backing services: MongoDB, Redis and RabbitMQ, plus Medusa for plan lookups
+# on renew/change-plan.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: billing
+  namespace: default
+  labels:
+    app: billing
+data:
+  NODE_ENV: "production"
+  PORT: "4041"
+
+  DATABASE_NAME: "autofik_billing"
+
+  REDIS_HOST: "redis.redis.svc.cluster.local"
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
+
+  # Must match the subscription service's exchange - they publish to each
+  # other on it (billing.* / subscription.*).
+  RABBITMQ_EXCHANGE: "autofik.billing"
+
+  MEDUSA_BASE_URL: "https://medusa.master.autofik.com/"
+
+  S3_REGION: "us-west-2"
+  S3_BUCKET_NAME: "autofik-sos"
+  S3_ENDPOINT: "https://fsgw.evauto24.com/"
+  S3_FILE_URL: "https://fsgw.evauto24.com/autofik-sos"
+  S3_FORCE_PATH_STYLE: "true"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: billing
+  namespace: default
+  labels:
+    app: billing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: billing
+  template:
+    metadata:
+      labels:
+        app: billing
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: billing
+          # No CI publishes this image - .github/workflows/master.yml in that
+          # repo is empty - so the tag is whatever `make push` last pushed
+          # (IMAGE_TAG in its .env, currently "internal"). Give it a real
+          # workflow like the subscription/sso repos have, or keep pushing by
+          # hand and bump this tag.
+          image: autofikbyslaap/dev.api.billing:internal
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 4041
+          # ConfigMap last so its cluster values win over the .env-derived
+          # Secret; explicit env entries below win over both.
+          envFrom:
+            - secretRef:
+                name: billing
+            - configMapRef:
+                name: billing
+          env:
+            - name: MONGO_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mongodb-admin
+                  key: username
+            - name: MONGO_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: mongodb-admin
+                  key: password
+            - name: DATABASE_URI
+              value: "mongodb://$(MONGO_USER):$(MONGO_PASS)@mongodb.mongodb.svc.cluster.local:27017/autofik_billing?authSource=admin"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: password
+            - name: RABBIT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-admin
+                  key: username
+            - name: RABBIT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-admin
+                  key: password
+            - name: RABBITMQ_URI
+              value: "amqp://$(RABBIT_USER):$(RABBIT_PASS)@rabbitmq.rabbitmq.svc.cluster.local:5672"
+          # /health is a static handler - it does not probe Mongo/Redis/Rabbit
+          # - so it is safe for liveness. The dependency that actually gates
+          # startup is RabbitMQ: the consumer rethrows on a failed subscribe,
+          # so Nest never finishes bootstrapping without a reachable broker
+          # and the startup probe below is what reports that.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 768Mi
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: billing
+  namespace: default
+  labels:
+    app: billing
+spec:
+  type: ClusterIP
+  selector:
+    app: billing
+  ports:
+    - name: http
+      protocol: TCP
+      port: 4041
+      targetPort: http

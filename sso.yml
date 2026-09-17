@@ -1,0 +1,197 @@
+# autofik.dev.api.user.auth.sso - the identity service.
+#
+# Every request through the billing gateway is authenticated against this
+# service (GET /api/user/verify-token), so nothing else in this stack works
+# until it does. It is also the only service here besides the gateway that is
+# published through APISIX - the mobile app calls it directly for login/OTP.
+#
+# Backing services: PostgreSQL (TypeORM) and Redis, both from the
+# api/ansible cluster, plus Authentik for OIDC and Telegram/Plasgate for OTP
+# delivery.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sso
+  namespace: default
+  labels:
+    app: sso
+data:
+  NODE_ENV: "production"
+  PORT: "4000"
+
+  # PostgreSQL lives in the `postgres` namespace on this cluster. DB_NAME is
+  # NOT the `postgres` maintenance database - sso-db-init.yml creates a
+  # dedicated `sso` database before the first rollout. DB_USER/DB_PASSWORD are
+  # not set here: they are referenced out of the postgres-admin Secret in the
+  # pod spec below, so no credential is ever written into this repo.
+  DB_HOST: "postgres.postgres.svc.cluster.local"
+  DB_PORT: "5432"
+  DB_NAME: "sso"
+  DB_SSL: "false"
+  DB_MAX_CONNECTIONS: "20"
+  DB_IDLE_TIMEOUT: "30000"
+  DB_CONNECTION_TIMEOUT: "60000"
+
+  # Authentik is NOT deployed in this cluster - the service talks to the
+  # external instance, exactly as the repo's own .env does. The client ids,
+  # slugs and redirect URIs all arrive through that .env (see
+  # scripts/build-secrets.sh) and are deliberately not pinned here: a redirect
+  # URI has to match what is registered on the Authentik provider, and only
+  # that provider can say what it is.
+  AUTHENTIK_PUBLIC_CLIENT: "true"
+  AUTHENTIK_OIDC_DISCOVERY: "true"
+
+  # Public base URL callers reach this API on. APISIX is published as a
+  # NodePort (apisix-gateway, 32756) because this cluster runs no ingress
+  # controller - change this as soon as a real hostname fronts it.
+  PUBLIC_API_URL: "http://10.10.10.1:32756"
+
+  # Comma-separated allowed browser origins. Empty means "no cross-origin
+  # browser calls" - the mobile app is not a browser origin and is unaffected.
+  CORS_ORIGIN: ""
+
+  # Service codes this API accepts on the `service-code` header. Only
+  # enforced on a user whose record already has a serviceCode set - see the
+  # note in README.md, because the billing gateway does not send this header.
+  SERVICE_CODES: "booking,payment,dispatch"
+
+  JWT_EXPIRATION: "3600"
+  ACCESS_TOKEN_EXP: "15m"
+  REFRESH_TOKEN_EXP: "7d"
+
+  TELEGRAM_GATEWAY_TTL: "300"
+  TELEGRAM_GATEWAY_TEST: "false"
+  PLASGATE_SENDER: "PlasGateUAT"
+  PLASGATE_BASE_URL: "https://cloudapi.plasgate.com"
+
+  # Profile-image storage.
+  S3_REGION: "us-west-2"
+  S3_BUCKET_NAME: "autofik-sos"
+  S3_ENDPOINT: "https://fsgw.evauto24.com/"
+  S3_FORCE_PATH_STYLE: "true"
+
+  # No Jaeger in this cluster - leaving the exporter on makes every request
+  # pay for an OTLP export that can never connect.
+  JAEGER_ENABLED: "false"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sso
+  namespace: default
+  labels:
+    app: sso
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sso
+  template:
+    metadata:
+      labels:
+        app: sso
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        # "node" in the node:24-alpine runtime stage.
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: sso
+          image: autofikbyslaap/dev.api.sso:master
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 4000
+          # Order matters. The ConfigMap is listed last so its cluster-specific
+          # values win over the same keys in the Secret, which is generated
+          # from the service repo's own .env (scripts/build-secrets.sh) and
+          # still carries that file's localhost defaults.
+          envFrom:
+            - secretRef:
+                name: sso
+            - configMapRef:
+                name: sso
+          # Datastore credentials are referenced out of Secrets the cluster
+          # already owns, never copied into this repo. Entries here also
+          # outrank everything envFrom brought in.
+          env:
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-admin
+                  key: username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-admin
+                  key: password
+            # Redis keeps its password inside redis.conf, so there is no key
+            # to reference directly - build-secrets.sh lifts it into
+            # redis-auth. $(VAR) is expanded by the kubelet from the entry
+            # above it.
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: password
+            - name: REDIS_URL
+              value: "redis://:$(REDIS_PASSWORD)@redis.redis.svc.cluster.local:6379"
+          # /health reports 503 when PostgreSQL or Redis is unreachable, which
+          # is exactly right for readiness - take the pod out of the Service
+          # until its dependencies are back. Liveness deliberately does NOT
+          # use it: a Redis blip would otherwise restart a process that is
+          # perfectly healthy and would have recovered on its own.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 768Mi
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sso
+  namespace: default
+  labels:
+    app: sso
+spec:
+  type: ClusterIP
+  selector:
+    app: sso
+  ports:
+    - name: http
+      protocol: TCP
+      port: 4000
+      targetPort: http

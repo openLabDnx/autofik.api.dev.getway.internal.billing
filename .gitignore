@@ -1,2 +1,3 @@
-# Real API keys - only secret.example.yml belongs in git.
+# Real credentials - only secrets.example.yml belongs in git.
+secrets.yml
 secret.yml

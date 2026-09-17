@@ -26,13 +26,14 @@ data:
   GRPC_LISTEN_ADDR: ":50055"
   GATEWAY_LISTEN_ADDR: ":8081"
 
-  # Downstream REST services this gateway proxies to. These are in-cluster
-  # Service DNS names - change them to whatever the billing / subscription /
-  # user-auth-sso Services are actually called in this namespace, or to an
-  # external URL if a service still runs outside the cluster.
+  # Downstream REST services this gateway proxies to - the Services declared
+  # by billing.yml, subscription.yml and sso.yml in this directory. Point
+  # these elsewhere only if a service runs outside the cluster.
   BILLING_SERVICE_URL: "http://billing.default.svc.cluster.local:4041"
-  SUBSCRIPTION_SERVICE_URL: "http://subscription.default.svc.cluster.local:4040"
-  USER_SERVICE_URL: "http://user-auth-sso.default.svc.cluster.local:4000"
+  # subscription runs in its own namespace (see subscription.yml), hence
+  # subscription.subscription rather than subscription.default.
+  SUBSCRIPTION_SERVICE_URL: "http://subscription.subscription.svc.cluster.local:4040"
+  USER_SERVICE_URL: "http://sso.default.svc.cluster.local:4000"
 
   # GET route on the user service that returns verify-token records. The
   # UserServiceVerifier appends this to USER_SERVICE_URL on every request.
@@ -75,9 +76,9 @@ spec:
             - name: http-gw
               containerPort: 8081
           envFrom:
-            - configMapRef:
-                name: billing-getway-internal
             - secretRef:
+                name: billing-getway-internal
+            - configMapRef:
                 name: billing-getway-internal
           # /healty (sic - that is the route the binary serves) is mounted
           # ahead of the grpc-gateway mux, so it never enters the gRPC

@@ -21,6 +21,7 @@
 #   UPSTREAM_NODE       default billing-getway-internal.default.svc.cluster.local:8081
 #                       (override for another namespace, or to point a second
 #                       APISIX at this gateway)
+#   SSO_UPSTREAM_NODE   default sso.default.svc.cluster.local:4000
 #   ADMIN_ALLOW_CIDRS   optional, comma-separated. When set, the admin route
 #                       below is wrapped in ip-restriction and only these
 #                       CIDRs can call the admin endpoints.
@@ -29,11 +30,14 @@ set -euo pipefail
 ADMIN_URL="${APISIX_ADMIN_URL:-http://127.0.0.1:9180}"
 ADMIN_KEY="${APISIX_ADMIN_KEY:-}"
 UPSTREAM_NODE="${UPSTREAM_NODE:-billing-getway-internal.default.svc.cluster.local:8081}"
+SSO_UPSTREAM_NODE="${SSO_UPSTREAM_NODE:-sso.default.svc.cluster.local:4000}"
 ADMIN_ALLOW_CIDRS="${ADMIN_ALLOW_CIDRS:-}"
 
 UPSTREAM_ID="billing-getway-internal"
+SSO_UPSTREAM_ID="sso"
 ROUTE_MOBILE_ID="billing-getway-mobile"
 ROUTE_ADMIN_ID="billing-getway-admin"
+ROUTE_SSO_ID="sso-public"
 
 if [ -z "$ADMIN_KEY" ]; then
   echo "APISIX_ADMIN_KEY is required (see api/ansible/.secrets/apisix_admin_key)" >&2
@@ -83,13 +87,16 @@ if [ "${1:-}" = "--delete" ]; then
   # Routes first: an upstream still referenced by a route cannot be deleted.
   call DELETE "/apisix/admin/routes/${ROUTE_ADMIN_ID}"
   call DELETE "/apisix/admin/routes/${ROUTE_MOBILE_ID}"
+  call DELETE "/apisix/admin/routes/${ROUTE_SSO_ID}"
   call DELETE "/apisix/admin/upstreams/${UPSTREAM_ID}"
+  call DELETE "/apisix/admin/upstreams/${SSO_UPSTREAM_ID}"
   echo "Done."
   exit 0
 fi
 
 echo "Seeding billing gateway routes into APISIX at ${ADMIN_URL}"
-echo "  upstream node: ${UPSTREAM_NODE}"
+echo "  gateway upstream: ${UPSTREAM_NODE}"
+echo "  sso upstream:     ${SSO_UPSTREAM_NODE}"
 
 # ---------------------------------------------------------------------------
 # Upstream: the internal gateway's REST/JSON listener.
@@ -208,5 +215,52 @@ call PUT "/apisix/admin/routes/${ROUTE_ADMIN_ID}" "$(cat <<EOF
 EOF
 )"
 
+# ---------------------------------------------------------------------------
+# SSO upstream and its public routes.
+#
+# The identity service is the only thing besides the billing gateway that is
+# published here - the mobile app calls it directly to log in and verify
+# OTPs, and every token the gateway later checks is minted through it. The
+# billing and subscription services get no route at all: the gateway is the
+# only thing allowed to reach them.
+#
+# /webhook/* is deliberately NOT routed. The only caller is Authentik, which
+# runs in this cluster and should be pointed at
+# http://sso.default.svc.cluster.local:4000/webhook/authentik/sms - there is
+# no reason to expose an SMS webhook to the internet, shared secret or not.
+# ---------------------------------------------------------------------------
+call PUT "/apisix/admin/upstreams/${SSO_UPSTREAM_ID}" "$(cat <<EOF
+{
+  "desc": "autofik.dev.api.user.auth.sso",
+  "type": "roundrobin",
+  "scheme": "http",
+  "pass_host": "pass",
+  "timeout": { "connect": 5, "send": 30, "read": 30 },
+  "nodes": { "${SSO_UPSTREAM_NODE}": 1 }
+}
+EOF
+)"
+
+call PUT "/apisix/admin/routes/${ROUTE_SSO_ID}" "$(cat <<EOF
+{
+  "name": "sso-public",
+  "desc": "Login, OTP and profile routes of the SSO service",
+  "uris": ["/api/user/*", "/api/mechanic/*"],
+  "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+  "priority": 0,
+  "upstream_id": "${SSO_UPSTREAM_ID}",
+  "plugins": {
+    "cors": {
+      "allow_origins": "*",
+      "allow_methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD",
+      "allow_headers": "Authorization,Content-Type,Accept,service-code,accept-language",
+      "max_age": 3600,
+      "allow_credential": false
+    }
+  }
+}
+EOF
+)"
+
 echo "Done. Smoke test (no token needed on the health route):"
-echo "  curl https://apisix.testing.autofik.com/mobile/v1/health"
+echo "  curl ${SMOKE_URL:-http://10.10.10.1:32756}/mobile/v1/health"

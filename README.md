@@ -1,154 +1,240 @@
 # billing-getway deploy
 
-Deployment for **autofik.dev.api.billing.getway.internal** on the RKE2 cluster
-from `api/ansible`, plus the APISIX configuration that puts it behind the
-external gateway.
+Kubernetes deployment for the billing stack — SSO, billing, subscription and
+the internal billing gateway — plus the APISIX configuration that fronts it.
 
 ```
-                                       ┌─ billing        :4041  (REST)
- mobile ──► APISIX ──► billing-getway ─┼─ subscription   :4040  (REST)
-  app      (edge)      internal :8081  └─ user.auth.sso  :4000  (verify-token)
-                              :50055 ◄── other in-cluster services (gRPC)
+                  ┌────────────────────────────────────────────────┐
+                  │                   cluster                      │
+ mobile           │                                                │
+  app ──NodePort──┼─► APISIX ─┬─► sso           :4000 ──► postgres, redis
+        32756     │  (edge)   │                      └─► Authentik (external)
+                  │           │                                    │
+                  │           └─► billing-getway :8081 ─┬─► billing      :4041
+                  │                  internal   :50055 ─┤   └─► mongodb, redis
+                  │                       ▲             └─► subscription :4040
+                  │                       │                 └─► mongodb, redis
+                  │              in-cluster gRPC callers          │
+                  │                                     billing ⇄ subscription
+                  │                                      over rabbitmq :5672
+                  └────────────────────────────────────────────────┘
 ```
 
-APISIX is the only way in from outside. It does no authentication of its own
-here — it forwards `Authorization` untouched, and the gateway's
-`UserVerificationUnaryInterceptor` verifies the bearer token against
-user.auth.sso before any handler runs. There is no `grpc-transcode` plugin
-either: the gateway binary transcodes REST ⇄ gRPC itself with grpc-gateway,
-generated from the `google.api.http` options in `billing.proto`.
+**Only two things are published.** The SSO service, because the app logs in
+against it directly, and the billing gateway, because it is the app's entire
+billing API. The billing and subscription services get no APISIX route and no
+Ingress — the gateway is the only thing allowed to reach them, and it is what
+verifies the caller's token before anything downstream runs.
+
+APISIX authenticates nothing here. It forwards `Authorization` untouched and
+the gateway's `UserVerificationUnaryInterceptor` checks it against the SSO
+service on every request.
+
+## This cluster
+
+The manifests are written for the cluster that is actually running, which
+differs from what `api/ansible` describes — that playbook has not been
+applied here. What is really in place:
+
+| What | Where |
+| --- | --- |
+| PostgreSQL | `postgres.postgres.svc.cluster.local:5432` (namespace `postgres`, not `postgresql`) |
+| Redis | `redis.redis.svc.cluster.local:6379` — **password required**, stored inside `redis.conf` |
+| MongoDB | `mongodb.mongodb.svc.cluster.local:27017` |
+| RabbitMQ | `rabbitmq.rabbitmq.svc.cluster.local:5672` — already deployed, so this repo ships no broker manifest |
+| APISIX | Helm release in `apisix`: Admin API on `apisix-admin:9180`, data plane on `apisix-gateway` NodePort **32756** |
+| Ingress | none — there is no ingress controller, so the NodePort is the only way in |
+| Authentik | not in-cluster; the SSO service talks to the external instance from its own `.env` |
+| Jaeger | not deployed — tracing is turned off in both ConfigMaps |
 
 ## Files
 
-| File | What it is |
+| File | What it deploys |
 | --- | --- |
-| `billing-getway.yml` | ConfigMap + Deployment + Service for the gateway |
-| `secret.example.yml` | template for the two downstream API keys |
+| `sso-db-init.yml` | Job that creates the `sso` database (idempotent) |
+| `sso.yml` | `autofik.dev.api.user.auth.sso` — identity, published |
+| `billing.yml` | `autofik.dev.api.billing` — internal |
+| `subscription.yml` | `autofik.dev.api.subscription` — internal |
+| `billing-getway.yml` | `autofik.dev.api.billing.getway.internal` — published |
+| `scripts/build-secrets.sh` | builds every Secret from the cluster + each repo's `.env` |
+| `scripts/mongo-create-root.sh` | one-time fix: creates MongoDB's missing root user |
+| `apisix/seed-routes.sh` | upstreams + routes, through the APISIX Admin API |
 | `kustomization.yaml` | what `kubectl apply -k .` applies |
-| `apisix/seed-routes.sh` | writes the upstream + routes through the APISIX Admin API |
-| `Makefile` | the commands below |
+
+| Service | Image | Port | Published |
+| --- | --- | --- | --- |
+| sso | `autofikbyslaap/dev.api.sso:master` | 4000 | `/api/user/*`, `/api/mechanic/*` |
+| billing | `autofikbyslaap/dev.api.billing:internal` | 4041 | no |
+| subscription | `autofikbyslaap/dev.api.subscription:internal` | 4040 | no — runs in its own `subscription` namespace |
+| billing-getway-internal | `autofikbyslaap/dev.api.billing.getway:master` | 8081 / 50055 | `/mobile/v1/*` |
+
+Only `dev.api.sso` and `dev.api.billing.getway` publish a `:master` tag. The
+billing repo's `master.yml` workflow is an empty file and the subscription
+repo's `dev-v*` workflow has never run, so both are on `:internal` — whatever
+`make push` last pushed by hand from those repos.
+
+## Credentials
+
+No credential is stored in this repo. `scripts/build-secrets.sh` assembles
+every Secret from sources that already exist and pipes them straight into
+`kubectl apply`, printing only key names and byte counts:
+
+- **Datastore credentials** are copied out of the cluster's own Secrets
+  (`postgres-admin`, `mongodb-admin`, `rabbitmq-admin`) into the app
+  namespace, because a `secretKeyRef` cannot cross namespaces. The pods
+  reference those keys and compose their connection URIs with `$(VAR)`
+  expansion, so a password never appears in a manifest.
+- **Redis** keeps its password inside `redis.conf`, where there is no key to
+  reference; the script lifts just the `requirepass` value into a `redis-auth`
+  Secret.
+- **Application credentials** (Authentik, Medusa, S3, Telegram, Plasgate) come
+  from each service repo's `.env`. The whole file is loaded rather than a
+  hand-maintained key list — the Deployments list their ConfigMap *after* the
+  Secret in `envFrom`, so every cluster-specific key is overridden and the
+  `.env` only supplies what the cluster has no opinion about. `DOCKER_*` is
+  stripped: a registry PAT has no business in an application pod.
+- **`JWT_SECRET`** is not in the SSO repo's `.env` at all, so the script mints
+  one — and reuses the existing value on later runs, because rotating it
+  invalidates every token that service has issued.
+
+```bash
+make secrets-check     # report what it would do, change nothing
+make secrets           # create/update all eight Secrets
+```
 
 ## Deploy
 
 ```bash
-export KUBECONFIG=/path/to/rke2.yaml     # on the RKE2 host: /etc/rancher/rke2/rke2.yaml
-
-cp secret.example.yml secret.yml         # fill in both keys - see below
-make secret                              # must exist before the pod starts
-make deploy                              # ConfigMap + Deployment + Service
-make routes                              # APISIX upstream + routes
-make verify                              # 200 from /mobile/v1/health through APISIX
+make secrets    # must exist before any pod can start
+make deploy     # db-init Job, ConfigMaps, Deployments, Services
+make routes     # APISIX upstreams + routes
+make verify     # 200 from /mobile/v1/health through APISIX
 ```
 
-`make all` runs secret → deploy → routes in one go.
+`make all` runs all three. `make deploy` deletes the db-init Job before
+re-applying, because a completed Job is immutable.
 
-### Before the first deploy, check these three things
+Single services deploy on their own, so a change to one never risks rolling
+the others:
 
-1. **Downstream URLs.** The `ConfigMap` in `billing-getway.yml` points at
-   `billing.default.svc.cluster.local:4041`,
-   `subscription.default.svc.cluster.local:4040` and
-   `user-auth-sso.default.svc.cluster.local:4000`. Those Services have no
-   manifests in this repo yet, so the names are a guess — set them to whatever
-   the Services are actually called, or to an external URL for anything still
-   running outside the cluster. Nothing works until `USER_SERVICE_URL` is
-   right: every request is authenticated against it.
+```bash
+make sso
+make billing
+make subscription
+make gateway
+```
 
-2. **The two API keys** in `secret.yml`. Both downstream services gate their
-   routes on an `x-publishable-api-key` header:
-   `USER_SERVICE_PUBLISHABLE_API_KEY` (missing → user.auth.sso 401s, so every
-   request looks like a bad token) and
-   `SUBSCRIPTION_SERVICE_PUBLISHABLE_API_KEY` (missing → plan/subscription
-   calls 400). The Deployment pulls the Secret in with `envFrom`, so the pod
-   will not start at all until it exists.
+**A ConfigMap edit alone does not restart anything.** These targets only
+`kubectl apply`; if you changed a ConfigMap and the Deployment spec is
+otherwise identical, Kubernetes sees no new revision and the running pod keeps
+its old environment. Follow with `make restart SERVICE=<name>`.
 
-3. **The image tag.** `autofikbyslaap/dev.api.billing.getway:master` is the
-   moving dev tag the repo's `master.yml` workflow re-points on every `dev-v*`
-   release. Pin `:dev-<version>` for a reproducible rollout.
+### Namespaces
+
+`subscription` runs in a namespace of its own; everything else is in
+`default`. A `secretKeyRef` cannot cross namespaces, so `mongodb-admin`,
+`rabbitmq-admin` and `redis-auth` are copied into *both* by
+`scripts/build-secrets.sh`, which also creates the namespace if it is missing
+(it has to exist before a Secret can be put in it). The gateway reaches the
+service at `subscription.subscription.svc.cluster.local:4040`; moving a
+service between namespaces means updating that URL in `billing-getway.yml`
+and restarting the gateway.
 
 ## APISIX routes
 
-`apisix/seed-routes.sh` writes three objects through the Admin API. APISIX
-runs in `traditional` role with etcd as its config provider, so routes are
-etcd entries, not Kubernetes objects — there is no CRD to `kubectl apply`.
-The Admin API is ClusterIP-only on port 9180; `make routes` opens its own
-`kubectl port-forward` and closes it again, and reads the admin key from
-`api/ansible/.secrets/apisix_admin_key`.
+`apisix/seed-routes.sh` writes two upstreams and three routes through the
+Admin API. APISIX is etcd-backed, so routes are etcd entries, not Kubernetes
+objects — there is no CRD to `kubectl apply`. The Admin API is ClusterIP-only;
+`make routes` opens its own `kubectl port-forward` and closes it again, and
+reads the admin key out of the running `apisix` ConfigMap so it follows the
+Helm release if the key is rotated.
 
-| Object | Matches | Notes |
+| Route | Matches | Upstream |
 | --- | --- | --- |
-| upstream `billing-getway-internal` | — | `billing-getway-internal.default.svc.cluster.local:8081`, 30s read timeout |
-| route `billing-getway-mobile` | `/mobile/v1/*` | the public surface, `cors` enabled |
-| route `billing-getway-admin` | `/mobile/v1/admin/*`, `/mobile/v1/billings/approve`, `/mobile/v1/billings/reject` | priority 10, optional `ip-restriction` |
+| `billing-getway-mobile` | `/mobile/v1/*` | gateway :8081 |
+| `billing-getway-admin` | `/mobile/v1/admin/*`, `/mobile/v1/billings/approve`, `/mobile/v1/billings/reject` | gateway :8081, priority 10 |
+| `sso-public` | `/api/user/*`, `/api/mechanic/*` | sso :4000 |
 
 Paths are forwarded unchanged — the gateway already serves `/mobile/v1/...`
-exactly as `billing.proto` declares it, so there is no `proxy-rewrite`.
+exactly as `billing.proto` declares it, so there is no `proxy-rewrite` and no
+`grpc-transcode` plugin; the gateway transcodes REST ⇄ gRPC itself.
 
-`/internal/v1/token/verify` is **not** routed. It is for in-cluster callers
-(e.g. the subscription service resolving a caller's identity); they reach it
-on the ClusterIP Service directly, never through the edge.
+Two paths are deliberately **not** routed:
+
+- `/internal/v1/token/verify` on the gateway — for in-cluster callers, which
+  reach it on the ClusterIP Service.
+- `/webhook/*` on the SSO service — its only caller is Authentik, which should
+  be pointed at `http://sso.default.svc.cluster.local:4000/webhook/authentik/sms`.
+  There is no reason to expose an SMS webhook to the internet.
 
 ### Locking down the admin route
 
 The gateway does not check roles on `ApproveBilling`, `RejectBilling`,
 `AdminListSubscriptions`, `AdminGetSubscription`, `ApproveSubscription` or
-`RejectSubscription` — it proxies each one with the caller's own token and
-leaves the decision to the billing/subscription service. **Any authenticated
-user can reach those endpoints** unless those services reject a non-admin
-role. Until you have confirmed they do, restrict the admin route by source:
+`RejectSubscription` — it proxies each with the caller's own token and leaves
+the decision to the billing/subscription service. **Any authenticated user can
+reach those endpoints** unless those services reject a non-admin role. Until
+that is confirmed, restrict the admin route by source:
 
 ```bash
 make routes ADMIN_ALLOW_CIDRS=10.0.0.0/8,203.0.113.7/32
 ```
 
-That adds an `ip-restriction` whitelist to `billing-getway-admin` only. With
-the variable unset the script prints a warning and leaves the route open —
-which is the behaviour of an unconfigured gateway, stated out loud.
-
-### Overrides
-
-Both the Admin API endpoint and the upstream node can be pointed elsewhere —
-another namespace, a second APISIX, an Admin API you already have reachable:
-
-```bash
-make routes APISIX_ADMIN_URL=http://127.0.0.1:9180 \
-            UPSTREAM_NODE=billing-getway-internal.billing.svc.cluster.local:8081
-```
-
-Setting `APISIX_ADMIN_URL` also skips the automatic port-forward.
-
-`make routes-delete` removes both routes and the upstream (routes first — an
-upstream still referenced by a route cannot be deleted).
+With the variable unset the script warns and leaves the route open.
 
 ## Day-to-day
 
 ```bash
-make status     # pods, service, endpoints
-make logs       # follow gateway logs
-make restart    # roll the Deployment to pick up a new :master image
-make undeploy   # delete the workload; routes and Secret are left alone
+make status                              # the whole stack
+make logs SERVICE=sso                    # sso | billing | subscription | billing-getway-internal
+make restart SERVICE=billing             # roll one service
+make undeploy                            # delete the workloads; Secrets and routes are left alone
 ```
 
-## Health and probes
+## Before this is production-shaped
 
-The binary serves two health surfaces, both exempt from token verification:
+- **`PUBLIC_API_URL` is a NodePort address** (`http://10.10.10.1:32756`) in
+  `sso.yml`, because the cluster has no ingress controller. It must match what
+  is registered on the Authentik provider — as must the redirect URIs, which
+  come from the SSO repo's `.env` untouched.
+- **MongoDB uses the root account** with `authSource=admin` for both
+  databases; that is the only account the cluster's MongoDB Secret describes.
+  Per-service users would be better.
+- **PostgreSQL uses the admin account** for the SSO service, for the same
+  reason.
 
-- `GET /healty` on `:8081` — a plain handler mounted ahead of the grpc-gateway
-  mux, so it never enters the gRPC interceptor chain. The Kubernetes
-  startup/readiness/liveness probes use this one.
-- `GET /mobile/v1/health` — goes all the way through grpc-gateway into the
-  `HealthCheck` RPC, which the interceptor skips by method name. `make verify`
-  uses this one, because a 200 proves the entire path works end to end.
+## Known integration gaps
 
-(`/healty` is the route the binary actually serves — the spelling is
-deliberate, not a typo here.)
+Real today, in the services' own code — worth knowing before debugging a
+deployment that is actually fine.
+
+- **The gateway never sends `service-code`.** The SSO verify-token controller
+  rejects a request with `INVALID_SERVICE_CODE` when the user's record has a
+  `serviceCode` set and the header does not match. Users whose record has none
+  are unaffected; for anyone else every billing request fails. Fixing it means
+  a change in the gateway's `middleware/user_auth.go`.
+- **One incomplete session blocks a user everywhere.** That controller 401s if
+  *any* of the user's verify-token rows has `otpVerify` or `profileVerify`
+  false, not just the row for the current device.
+- **The gateway reads `data[0]`.** The SSO side filters by the authenticated
+  user, so it is the right user — but with several active devices it is an
+  arbitrary one of their sessions, and the `deviceId` forwarded downstream may
+  not be the device that made the call.
+- **`USER_SERVICE_PUBLISHABLE_API_KEY` does nothing yet.** The gateway sends
+  `x-publishable-api-key` on every verify, but the SSO service has no
+  publishable-key middleware at all. It is left empty.
 
 ## Troubleshooting
 
 | Symptom | Cause |
 | --- | --- |
-| Pod stuck in `CreateContainerConfigError` | `secret.yml` was never applied — run `make secret` |
-| Every request 401s with a valid token | `USER_SERVICE_PUBLISHABLE_API_KEY` missing/wrong, or `USER_SERVICE_URL` points somewhere that is not user.auth.sso |
-| Subscription/plan calls 400, billing calls fine | `SUBSCRIPTION_SERVICE_PUBLISHABLE_API_KEY` missing |
-| APISIX returns 404 | routes were never seeded, or seeded into a different APISIX — `make routes` |
-| APISIX returns 503 | upstream node name does not resolve; check `make status` shows endpoints |
-| Auth works for some users, fails for others | known upstream issue: user.auth.sso's `GET /api/user/verify-token` returns *every* verify-token row unfiltered, and the gateway reads `data[0]`. It is only correct while that table holds a single active record — see the note in `middleware/user_auth.go` |
+| Pod in `CreateContainerConfigError` | its Secret does not exist — `make secrets` |
+| billing / subscription crash-loop on boot | RabbitMQ unreachable — their consumers rethrow on a failed subscribe |
+| sso crash-loops with a TypeORM connect error | the `sso` database is missing — re-run the db-init Job |
+| sso readiness fails, `/health` returns 503 | PostgreSQL or Redis unreachable — the body names which |
+| Every billing request 401s with a valid token | SSO unreachable from the gateway, or the `service-code` mismatch above |
+| Subscription/plan calls 400, billing calls fine | the gateway's `SUBSCRIPTION_SERVICE_PUBLISHABLE_API_KEY` and the subscription service's `MEDUSA_PUBLISHABLE_API_KEY` differ |
+| Mongo `Authentication failed` for every credential, including MongoDB's own | no user exists — the image only runs `MONGO_INITDB_ROOT_*` on an empty data dir, and this PVC was not. `./scripts/mongo-create-root.sh --check` confirms it; run it without `--check` to fix |
+| `deployment "x" exceeded its progress deadline` | the pod spent longer than `progressDeadlineSeconds` (600s) not-Ready — usually waiting on a Secret. Harmless once the pod is Ready; re-run `make deploy` to clear the condition |
+| APISIX returns 404 | no route matched — `make routes` |
+| APISIX returns 502/503 | route matched but the upstream has no ready pod — `make status` |

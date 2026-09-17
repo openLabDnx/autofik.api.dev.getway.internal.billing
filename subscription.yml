@@ -1,0 +1,182 @@
+# autofik.dev.api.subscription - plans, subscriptions, payments.
+#
+# Internal only: no APISIX route and no Ingress, same reasoning as the
+# billing service. It never authenticates callers itself - it trusts the
+# `user-context` header the billing gateway sets from an already-verified
+# principal, and ignores any userId/role in the request body.
+#
+# Backing services: MongoDB, Redis and RabbitMQ, plus Medusa for the plan
+# catalogue.
+#
+# This service runs in its own `subscription` namespace rather than `default`.
+# A secretKeyRef cannot cross namespaces, so the datastore credentials it
+# reads (mongodb-admin, rabbitmq-admin, redis-auth) have to exist in here too
+# - scripts/build-secrets.sh copies them into both namespaces. The gateway
+# reaches it at subscription.subscription.svc.cluster.local:4040.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: subscription
+  labels:
+    app: subscription
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: subscription
+  namespace: subscription
+  labels:
+    app: subscription
+data:
+  NODE_ENV: "production"
+  PORT: "4040"
+
+  MONGODB_DATABASE: "subscription"
+
+  REDIS_HOST: "redis.redis.svc.cluster.local"
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
+
+  # Must match the billing service's exchange.
+  RABBITMQ_EXCHANGE: "autofik.billing"
+
+  MEDUSA_BASE_URL: "https://medusa.master.autofik.com/"
+  MEDUSA_PLAN_CACHE_TTL_SECONDS: "120"
+
+  S3_REGION: "us-west-2"
+  S3_BUCKET_NAME: "autofik-sos"
+  S3_ENDPOINT: "https://fsgw.evauto24.com/"
+  S3_FILE_URL: "https://fsgw.evauto24.com/autofik-sos"
+  S3_FORCE_PATH_STYLE: "true"
+
+  # No Jaeger in this cluster - leaving the exporter on makes every request
+  # pay for an OTLP export that can never connect.
+  JAEGER_ENABLED: "false"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: subscription
+  namespace: subscription
+  labels:
+    app: subscription
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: subscription
+  template:
+    metadata:
+      labels:
+        app: subscription
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: subscription
+          # :master does not exist on Docker Hub - that repo's dev-v* workflow
+          # has never run, so `internal` (pushed by its Makefile) is the only
+          # published tag.
+          image: autofikbyslaap/dev.api.subscription:internal
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 4040
+          # ConfigMap last so its cluster values win over the .env-derived
+          # Secret; explicit env entries below win over both.
+          envFrom:
+            - secretRef:
+                name: subscription
+            - configMapRef:
+                name: subscription
+          env:
+            - name: MONGO_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mongodb-admin
+                  key: username
+            - name: MONGO_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: mongodb-admin
+                  key: password
+            # authSource=admin, not the subscription database: the cluster's
+            # MongoDB has only the root user its Secret describes.
+            - name: MONGODB_URI
+              value: "mongodb://$(MONGO_USER):$(MONGO_PASS)@mongodb.mongodb.svc.cluster.local:27017/subscription?authSource=admin"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: password
+            - name: RABBIT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-admin
+                  key: username
+            - name: RABBIT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-admin
+                  key: password
+            - name: RABBITMQ_URI
+              value: "amqp://$(RABBIT_USER):$(RABBIT_PASS)@rabbitmq.rabbitmq.svc.cluster.local:5672"
+          # Static /health handler, same as the billing service - and the
+          # same RabbitMQ startup dependency, since its BillingEventConsumer
+          # also rethrows when it cannot subscribe.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 768Mi
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: subscription
+  namespace: subscription
+  labels:
+    app: subscription
+spec:
+  type: ClusterIP
+  selector:
+    app: subscription
+  ports:
+    - name: http
+      protocol: TCP
+      port: 4040
+      targetPort: http
