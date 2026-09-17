@@ -77,8 +77,6 @@ spec:
           envFrom:
             - configMapRef:
                 name: billing-getway-internal
-            - secretRef:
-                name: billing-getway-internal
           # /healty (sic - that is the route the binary serves) is mounted
           # ahead of the grpc-gateway mux, so it never enters the gRPC
           # interceptor chain and needs no bearer token.
