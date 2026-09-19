@@ -27,6 +27,9 @@ generated from the `google.api.http` options in `billing.proto`.
 | `kustomization.yaml` | what `kubectl apply -k .` applies |
 | `apisix/seed-routes.sh` | writes the upstream + routes through the APISIX Admin API |
 | `apisix/seed-routes-dashboard.sh` | the same objects through the published dashboard, for a cluster you have no kubeconfig for |
+| `argocd-application.yaml` | the ArgoCD Application (bootstrap; Terraform owns it afterwards) |
+| `terraform/` | pins which released image tag ArgoCD deploys - see [Releasing](#releasing-tag-build-deploy) |
+| `.github/workflows/deploy.yml` | runs that Terraform when the app repo publishes a release |
 | `Makefile` | the commands below |
 
 ## Deploy
@@ -146,6 +149,85 @@ Setting `APISIX_ADMIN_URL` also skips the automatic port-forward.
 
 `make routes-delete` removes both routes and the upstream (routes first — an
 upstream still referenced by a route cannot be deleted).
+
+## Releasing: tag, build, deploy
+
+Tagging the **app** repo is the whole deploy. There is nothing to run by hand:
+
+```
+app repo: git tag dev-v1.2.3 && git push --tags
+   |
+   +-- master.yml: test -> build -> push  autofikbyslaap/dev.api.billing.getway:dev-1.2.3
+   |                                      (also re-tags :master)
+   +-- repository_dispatch ------------------> this repo
+                                                  |
+                          .github/workflows/deploy.yml: terraform apply
+                                                  |
+                          ArgoCD Application spec.source.kustomize.images
+                                = ...:dev-1.2.3
+                                                  |
+                          ArgoCD syncs -> Deployment rolls -> wait for Healthy
+```
+
+Mind the two tag shapes: the **git tag** is `dev-v1.2.3`, the **image tag** it
+produces is `dev-1.2.3` (no `v`). Terraform rejects the wrong one rather than
+silently deploying nothing.
+
+### Why Terraform only owns the Application
+
+`terraform/` manages exactly one object - the ArgoCD `Application` - and
+nothing else. The Deployment, Service, ConfigMap and PDB stay ArgoCD's, synced
+from `kustomization.yaml` as before.
+
+That is not an arbitrary split. The Application has `selfHeal: true`, so
+anything editing the Deployment behind ArgoCD's back is reverted within ~3
+minutes. Terraform instead sets the Application's kustomize **image override**,
+which asks ArgoCD to roll the new tag out. No two controllers own the same
+object, so there is nothing to fight over.
+
+It also means the deploy is recorded: `spec.source.kustomize.images` on the
+live Application always names the exact immutable tag that is running. Pinning
+`:master` would not - it is a moving tag, so it produces no diff, ArgoCD sees
+no change and deploys nothing. Terraform refuses `master`, `testing`,
+`production` and `latest` for that reason.
+
+### One-time setup
+
+**1. Hand the existing Application over to Terraform.** If `kubectl apply -f
+argocd-application.yaml` already created it, import it - otherwise the first
+apply fails with "resource already exists":
+
+```bash
+make tf-init
+cd terraform && terraform import kubernetes_manifest.billing_gateway_app \
+  "apiVersion=argoproj.io/v1alpha1,kind=Application,namespace=argocd,name=billing-getway-internal"
+```
+
+**2. Secrets on *this* repo** (Settings -> Secrets -> Actions):
+
+| Secret | What |
+| --- | --- |
+| `KUBECONFIG_B64` | `base64 -w0` of a kubeconfig for the cluster ArgoCD runs in. Its `server:` must be reachable from a GitHub runner - RKE2 writes `127.0.0.1`, which is not |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | same as the app repo, for deploy notifications |
+
+**3. A secret on the *app* repo:** `DEPLOY_DISPATCH_TOKEN`, a PAT with
+`contents: write` on this repo. The two repos are in different GitHub orgs
+(`autofik-development` and `openLabDnx`), so the built-in `GITHUB_TOKEN`
+cannot reach across - this is the one credential that makes the chain work.
+
+### Deploying or rolling back by hand
+
+```bash
+make tf-apply IMAGE_TAG=dev-1.2.2      # roll back to the previous release
+make tf-plan  IMAGE_TAG=dev-1.2.3      # see what would change first
+```
+
+Or run the **Deploy released image** workflow from the Actions tab with a tag.
+A rollback is just an older tag - the state and the Application both record
+what is live.
+
+Terraform state is a Secret in the cluster (`terraform-state` namespace), so
+there is no bucket to provision; `make tf-init` creates that namespace.
 
 ## Day-to-day
 

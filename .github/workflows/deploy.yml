@@ -1,0 +1,165 @@
+# Roll out a released image.
+#
+# The app repo (autofik.dev.api.billing.getway.internal) builds and pushes
+# the image on a `dev-v*` tag, then fires a repository_dispatch here with the
+# immutable tag it published. Terraform rewrites the ArgoCD Application's
+# kustomize image override, and ArgoCD does the actual rollout.
+#
+# Nothing in this workflow touches the Deployment directly - if it did, the
+# Application's `selfHeal: true` would revert it within ~3 minutes.
+name: Deploy released image
+
+on:
+  repository_dispatch:
+    types: [deploy-image]
+
+  # Same path by hand, for a rollback or a re-deploy.
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Immutable image tag, e.g. dev-1.2.3 (NOT the git tag dev-v1.2.3)"
+        required: true
+        type: string
+
+# Two applies at once would collide on the Terraform state lock, and the
+# second would fail rather than queue. Serialise them instead; never cancel a
+# run mid-apply, which can leave the lock held.
+concurrency:
+  group: deploy-billing-getway
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout deploy repository
+        uses: actions/checkout@v7
+
+      - name: Resolve the image tag
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG='${{ inputs.image_tag }}'
+          else
+            TAG='${{ github.event.client_payload.image_tag }}'
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "::error::No image tag supplied. A repository_dispatch must carry client_payload.image_tag."
+            exit 1
+          fi
+
+          echo "IMAGE_TAG=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Deploying image tag: $TAG"
+
+      - name: Notify deploy started
+        env:
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+        run: |
+          curl -s -X POST \
+          https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage \
+          -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
+          ${TELEGRAM_MESSAGE_THREAD_ID:+-d message_thread_id="$TELEGRAM_MESSAGE_THREAD_ID"} \
+          -d parse_mode=HTML \
+          -d text=$'🚢 <b>Deploy Started</b>\n\nService: billing-getway-internal\nImage tag: ${{ steps.resolve.outputs.IMAGE_TAG }}\n\nTriggered by: ${{ github.actor }}'
+
+      # The kubeconfig for the cluster ArgoCD runs in, base64-encoded so it
+      # survives being a single-line secret:
+      #   base64 -w0 /etc/rancher/rke2/rke2.yaml
+      # Its server: address must be reachable from a GitHub runner, so the
+      # 127.0.0.1 that RKE2 writes has to be replaced with the public address.
+      - name: Write kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          if [ -z "$KUBECONFIG_B64" ]; then
+            echo "::error::Secret KUBECONFIG_B64 is not set on this repository."
+            exit 1
+          fi
+          printf '%s' "$KUBECONFIG_B64" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+          chmod 600 "$RUNNER_TEMP/kubeconfig"
+          kubectl --kubeconfig="$RUNNER_TEMP/kubeconfig" version -o yaml | head -5
+
+      # The kubernetes state backend stores a Secret but will not create the
+      # namespace holding it, so the very first run needs this.
+      - name: Ensure the Terraform state namespace exists
+        run: |
+          kubectl --kubeconfig="$RUNNER_TEMP/kubeconfig" create namespace terraform-state \
+            --dry-run=client -o yaml \
+          | kubectl --kubeconfig="$RUNNER_TEMP/kubeconfig" apply -f -
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -input=false \
+            -backend-config="config_path=$RUNNER_TEMP/kubeconfig"
+
+      - name: Terraform apply
+        working-directory: terraform
+        run: |
+          terraform apply -input=false -auto-approve \
+            -var="image_tag=${{ steps.resolve.outputs.IMAGE_TAG }}" \
+            -var="kubeconfig_path=$RUNNER_TEMP/kubeconfig"
+
+      # Terraform returns as soon as the Application spec is written, which is
+      # before ArgoCD has rolled anything out. Without this the job goes green
+      # while the new pods are still starting - or still crash-looping.
+      - name: Wait for ArgoCD to sync and report healthy
+        run: |
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+
+          kubectl -n argocd wait --timeout=300s \
+            --for=jsonpath='{.status.sync.status}'=Synced \
+            application/billing-getway-internal
+
+          kubectl -n argocd wait --timeout=300s \
+            --for=jsonpath='{.status.health.status}'=Healthy \
+            application/billing-getway-internal
+
+          echo "--- running images ---"
+          kubectl -n billing-gateway get deployment billing-getway-internal \
+            -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}'
+
+      - name: Report what went wrong
+        if: failure()
+        run: |
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+          echo "--- application ---"
+          kubectl -n argocd get application billing-getway-internal -o wide || true
+          echo "--- conditions ---"
+          kubectl -n argocd get application billing-getway-internal \
+            -o jsonpath='{range .status.conditions[*]}{.type}: {.message}{"\n"}{end}' || true
+          echo "--- pods ---"
+          kubectl -n billing-gateway get pods -o wide || true
+          echo "--- recent events ---"
+          kubectl -n billing-gateway get events --sort-by=.lastTimestamp | tail -20 || true
+
+      - name: Notify success
+        if: success()
+        env:
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+        run: |
+          curl -s -X POST \
+          https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage \
+          -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
+          ${TELEGRAM_MESSAGE_THREAD_ID:+-d message_thread_id="$TELEGRAM_MESSAGE_THREAD_ID"} \
+          -d parse_mode=HTML \
+          -d text=$'✅ <b>Deploy Success</b>\n\nService: billing-getway-internal\nImage tag: ${{ steps.resolve.outputs.IMAGE_TAG }}\nArgoCD: Synced / Healthy'
+
+      - name: Notify failure
+        if: failure()
+        env:
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+        run: |
+          curl -s -X POST \
+          https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage \
+          -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
+          ${TELEGRAM_MESSAGE_THREAD_ID:+-d message_thread_id="$TELEGRAM_MESSAGE_THREAD_ID"} \
+          -d parse_mode=HTML \
+          -d text=$'❌ <b>Deploy Failed</b>\n\nService: billing-getway-internal\nImage tag: ${{ steps.resolve.outputs.IMAGE_TAG }}\n\nCheck GitHub Actions logs.'

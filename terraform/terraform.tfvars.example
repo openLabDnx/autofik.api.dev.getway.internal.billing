@@ -1,0 +1,10 @@
+# Copy to terraform.tfvars for local runs. CI passes these on the command
+# line instead, so this file is only a convenience - and it is gitignored,
+# like secret.yml, because a kubeconfig path is environment-specific.
+
+image_tag = "dev-1.2.3"
+
+# Only needed if your kubeconfig is not ~/.kube/config or the current context
+# is not the cluster ArgoCD runs in.
+# kubeconfig_path = "/etc/rancher/rke2/rke2.yaml"
+# kube_context    = "default"

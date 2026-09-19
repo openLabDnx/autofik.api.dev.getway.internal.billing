@@ -12,6 +12,17 @@
 # NOTE: this does NOT create the APISIX routes - those live in the master
 # APISIX's etcd and are added through the dashboard / Admin API (see the
 # repo README and apisix/seed-routes.sh). Do the routes AFTER this syncs.
+# BOOTSTRAP ONLY once Terraform is in use. terraform/ manages this same
+# Application and additionally pins `spec.source.kustomize.images` to the
+# released image tag. Applying this file by hand after that point wipes the
+# pin, and ArgoCD falls back to whatever :master happens to be - which is the
+# problem the Terraform setup exists to solve.
+#
+# Use it to create the Application the first time (or on a cluster with no
+# Terraform), then hand ownership over:
+#   terraform import kubernetes_manifest.billing_gateway_app \
+#     "apiVersion=argoproj.io/v1alpha1,kind=Application,namespace=argocd,name=billing-getway-internal"
+#
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:

@@ -23,7 +23,7 @@ DASH_USER ?= admin
 APISIX_ADMIN_KEY_FILE ?= ../../api/ansible/.secrets/apisix_admin_key
 APISIX_ADMIN_KEY ?= $(shell [ -f "$(APISIX_ADMIN_KEY_FILE)" ] && tr -d "[:space:]" < "$(APISIX_ADMIN_KEY_FILE)")
 
-.PHONY: help namespace secret fix-secret deploy all undeploy restart status logs port-forward routes routes-delete routes-dashboard verify
+.PHONY: help namespace secret fix-secret deploy all undeploy restart status logs port-forward routes routes-delete routes-dashboard verify tf-init tf-plan tf-apply tf-state-namespace
 
 help:
 	@echo "namespace     create the $(NAMESPACE) namespace (idempotent)"
@@ -40,6 +40,10 @@ help:
 	@echo "routes-delete remove the APISIX routes"
 	@echo "routes-dashboard  seed the routes through the published dashboard (no kubeconfig needed)"
 	@echo "verify        curl the public health route through APISIX"
+	@echo ""
+	@echo "tf-init       terraform init (state lives in a Secret in the cluster)"
+	@echo "tf-plan       show what deploying IMAGE_TAG=<tag> would change"
+	@echo "tf-apply      point the ArgoCD Application at IMAGE_TAG=<tag>"
 
 # The Deployment consumes this Secret via envFrom, so it must exist before
 # the pod can start - apply it first, not after. The namespace has to exist
@@ -122,3 +126,35 @@ routes-dashboard:
 # upstream -> grpc-gateway -> gRPC handler.
 verify:
 	curl -fsS "https://$(APISIX_HOSTNAME)/mobile/v1/health" && echo
+
+# ---------------------------------------------------------------------------
+# Terraform - the release-triggered deploy
+#
+# Terraform owns ONLY the ArgoCD Application, whose kustomize image override
+# pins which image tag ArgoCD rolls out. It does not manage the Deployment;
+# the Application's selfHeal would just revert it. Normally CI runs this on a
+# repository_dispatch from the app repo - these targets are for doing it by
+# hand (a rollback, or the first run).
+#
+#   make tf-apply IMAGE_TAG=dev-1.2.3
+# ---------------------------------------------------------------------------
+
+TF ?= terraform
+TF_DIR ?= terraform
+KUBECONFIG_PATH ?= $(if $(KUBECONFIG),$(KUBECONFIG),$(HOME)/.kube/config)
+TF_STATE_NAMESPACE ?= terraform-state
+
+# The kubernetes backend stores a Secret but will not create its namespace.
+tf-state-namespace:
+	$(KUBECTL) create namespace $(TF_STATE_NAMESPACE) --dry-run=client -o yaml | $(KUBECTL) apply -f -
+
+tf-init: tf-state-namespace
+	cd $(TF_DIR) && $(TF) init -input=false -backend-config="config_path=$(KUBECONFIG_PATH)"
+
+tf-plan:
+	@test -n "$(IMAGE_TAG)" || { echo "IMAGE_TAG is required, e.g. make tf-plan IMAGE_TAG=dev-1.2.3"; exit 1; }
+	cd $(TF_DIR) && $(TF) plan -input=false -var="image_tag=$(IMAGE_TAG)" -var="kubeconfig_path=$(KUBECONFIG_PATH)"
+
+tf-apply:
+	@test -n "$(IMAGE_TAG)" || { echo "IMAGE_TAG is required, e.g. make tf-apply IMAGE_TAG=dev-1.2.3"; exit 1; }
+	cd $(TF_DIR) && $(TF) apply -input=false -var="image_tag=$(IMAGE_TAG)" -var="kubeconfig_path=$(KUBECONFIG_PATH)"
