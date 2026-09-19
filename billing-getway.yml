@@ -56,7 +56,10 @@ metadata:
   labels:
     app: billing-getway-internal
 spec:
-  replicas: 1
+  # Two replicas spread across the worker nodes: the gateway is stateless (it
+  # holds no data, it only proxies), so a second copy costs nothing and keeps
+  # the API up through a node reboot or a drain.
+  replicas: 2
   selector:
     matchLabels:
       app: billing-getway-internal
@@ -65,6 +68,20 @@ spec:
       labels:
         app: billing-getway-internal
     spec:
+      # Keep the two replicas off the same node, so losing one node never
+      # takes the whole gateway with it. Deliberately `preferred` and not
+      # `required`: on a single-node cluster (the local dev one) `required`
+      # leaves the second pod Pending for ever and wedges `rollout status`.
+      # With three nodes the scheduler separates them anyway.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: billing-getway-internal
+                topologyKey: kubernetes.io/hostname
       securityContext:
         runAsNonRoot: true
         # 65532 = the "nonroot" user baked into the distroless base image the
@@ -148,3 +165,22 @@ spec:
       protocol: TCP
       port: 50055
       targetPort: grpc
+---
+# Keeps at least one gateway pod serving while a node is drained (an upgrade,
+# a reboot, `kubectl drain`). Without this the scheduler is free to evict both
+# replicas at once and the API goes dark for the length of the drain.
+#
+# minAvailable 1 with replicas 2 means a drain can take one pod and must then
+# wait for its replacement to become Ready before taking the other.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: billing-getway-internal
+  namespace: billing-gateway
+  labels:
+    app: billing-getway-internal
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: billing-getway-internal
