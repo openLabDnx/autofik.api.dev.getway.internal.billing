@@ -23,11 +23,12 @@ DASH_USER ?= admin
 APISIX_ADMIN_KEY_FILE ?= ../../api/ansible/.secrets/apisix_admin_key
 APISIX_ADMIN_KEY ?= $(shell [ -f "$(APISIX_ADMIN_KEY_FILE)" ] && tr -d "[:space:]" < "$(APISIX_ADMIN_KEY_FILE)")
 
-.PHONY: help namespace secret deploy all undeploy restart status logs port-forward routes routes-delete routes-dashboard verify
+.PHONY: help namespace secret fix-secret deploy all undeploy restart status logs port-forward routes routes-delete routes-dashboard verify
 
 help:
 	@echo "namespace     create the $(NAMESPACE) namespace (idempotent)"
 	@echo "secret        apply secret.yml (copy it from secret.example.yml first)"
+	@echo "fix-secret    namespace + secret + unstick CreateContainerConfigError pods"
 	@echo "deploy        apply the ConfigMap/Deployment/Service"
 	@echo "all           secret + deploy + routes"
 	@echo "undeploy      delete the workload (routes and Secret are left alone)"
@@ -49,6 +50,13 @@ secret: namespace
 
 namespace:
 	$(KUBECTL) create namespace $(NAMESPACE) --dry-run=client -o yaml | $(KUBECTL) apply -f -
+
+# One-shot repair for a pod stuck in CreateContainerConfigError: ensures the
+# namespace, applies the Secret, deletes the wedged pods and waits. Prompts
+# for confirmation and prints the target cluster first - pass YES=1 to skip.
+# Point it at another cluster with KUBECONFIG=... or CONTEXT=...
+fix-secret:
+	NAMESPACE=$(NAMESPACE) ./scripts/fix-secret.sh
 
 deploy:
 	$(KUBECTL) apply -k .
