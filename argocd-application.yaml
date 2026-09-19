@@ -30,8 +30,8 @@ spec:
     # The cluster ArgoCD itself runs in (the master cluster). Change only if
     # ArgoCD manages master as a remote/external cluster under another name.
     server: https://kubernetes.default.svc
-    # The manifests hardcode `namespace: default`; keep this in sync with them.
-    namespace: default
+    # The manifests hardcode `namespace: billing-gateway`; keep this in sync.
+    namespace: billing-gateway
 
   syncPolicy:
     automated:

@@ -13,11 +13,21 @@
 #
 # Apply with `make deploy` (or kubectl apply -k .) - see README.md.
 ---
+# All of this gateway's own objects live here. ArgoCD also has
+# CreateNamespace=true, but keeping the Namespace in git means `kubectl
+# apply -k .` works on a fresh cluster too.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: billing-gateway
+  labels:
+    app: billing-getway-internal
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: billing-getway-internal
-  namespace: default
+  namespace: billing-gateway
   labels:
     app: billing-getway-internal
 data:
@@ -42,7 +52,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: billing-getway-internal
-  namespace: default
+  namespace: billing-gateway
   labels:
     app: billing-getway-internal
 spec:
@@ -122,7 +132,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: billing-getway-internal
-  namespace: default
+  namespace: billing-gateway
   labels:
     app: billing-getway-internal
 spec:

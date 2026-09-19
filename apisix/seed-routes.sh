@@ -18,7 +18,7 @@
 # Environment:
 #   APISIX_ADMIN_URL    default http://127.0.0.1:9180
 #   APISIX_ADMIN_KEY    required
-#   UPSTREAM_NODE       default billing-getway-internal.default.svc.cluster.local:8081
+#   UPSTREAM_NODE       default billing-getway-internal.billing-gateway.svc.cluster.local:8081
 #                       (override for another namespace, or to point a second
 #                       APISIX at this gateway)
 #   ADMIN_ALLOW_CIDRS   optional, comma-separated. When set, the admin route
@@ -28,7 +28,7 @@ set -euo pipefail
 
 ADMIN_URL="${APISIX_ADMIN_URL:-http://127.0.0.1:9180}"
 ADMIN_KEY="${APISIX_ADMIN_KEY:-}"
-UPSTREAM_NODE="${UPSTREAM_NODE:-billing-getway-internal.default.svc.cluster.local:8081}"
+UPSTREAM_NODE="${UPSTREAM_NODE:-billing-getway-internal.billing-gateway.svc.cluster.local:8081}"
 ADMIN_ALLOW_CIDRS="${ADMIN_ALLOW_CIDRS:-}"
 
 UPSTREAM_ID="billing-getway-internal"

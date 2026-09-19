@@ -22,7 +22,7 @@ generated from the `google.api.http` options in `billing.proto`.
 
 | File | What it is |
 | --- | --- |
-| `billing-getway.yml` | ConfigMap + Deployment + Service for the gateway |
+| `billing-getway.yml` | Namespace + ConfigMap + Deployment + Service for the gateway |
 | `secret.example.yml` | template for the two downstream API keys |
 | `kustomization.yaml` | what `kubectl apply -k .` applies |
 | `apisix/seed-routes.sh` | writes the upstream + routes through the APISIX Admin API |
@@ -35,8 +35,8 @@ generated from the `google.api.http` options in `billing.proto`.
 export KUBECONFIG=/path/to/rke2.yaml     # on the RKE2 host: /etc/rancher/rke2/rke2.yaml
 
 cp secret.example.yml secret.yml         # fill in both keys - see below
-make secret                              # must exist before the pod starts
-make deploy                              # ConfigMap + Deployment + Service
+make secret                              # creates the namespace, then the Secret
+make deploy                              # Namespace + ConfigMap + Deployment + Service
 make routes                              # APISIX upstream + routes
 make verify                              # 200 from /mobile/v1/health through APISIX
 ```
@@ -47,8 +47,10 @@ make verify                              # 200 from /mobile/v1/health through AP
 
 1. **Downstream URLs.** The `ConfigMap` in `billing-getway.yml` points at
    `billing.default.svc.cluster.local:4041`,
-   `subscription.default.svc.cluster.local:4040` and
-   `user-auth-sso.default.svc.cluster.local:4000`. Those Services have no
+   `subscription.subscription.svc.cluster.local:4040` and
+   `sso.default.svc.cluster.local:4000`. These are *other* namespaces on
+   purpose - only the gateway's own objects live in `billing-gateway`.
+   Those Services have no
    manifests in this repo yet, so the names are a guess — set them to whatever
    the Services are actually called, or to an external URL for anything still
    running outside the cluster. Nothing works until `USER_SERVICE_URL` is
@@ -84,7 +86,7 @@ The Admin API is ClusterIP-only on port 9180; `make routes` opens its own
 
 | Object | Matches | Notes |
 | --- | --- | --- |
-| upstream `billing-getway-internal` | — | `billing-getway-internal.default.svc.cluster.local:8081`, 30s read timeout |
+| upstream `billing-getway-internal` | — | `billing-getway-internal.billing-gateway.svc.cluster.local:8081`, 30s read timeout |
 | route `billing-getway-mobile` | `/mobile/v1/*` | the public surface, `cors` enabled |
 | route `billing-getway-admin` | `/mobile/v1/admin/*`, `/mobile/v1/billings/approve`, `/mobile/v1/billings/reject` | priority 10, optional `ip-restriction` |
 
@@ -172,7 +174,8 @@ deliberate, not a typo here.)
 
 | Symptom | Cause |
 | --- | --- |
-| Pod stuck in `CreateContainerConfigError` | `secret.yml` was never applied — run `make secret` |
+| Pod stuck in `CreateContainerConfigError` | `secret.yml` was never applied *in the `billing-gateway` namespace* — run `make secret`. A Secret sitting in `default` does not count |
+| `kubectl get pods` shows nothing | everything moved to the `billing-gateway` namespace — add `-n billing-gateway`, or use `make status` |
 | Every request 401s with a valid token | `USER_SERVICE_PUBLISHABLE_API_KEY` missing/wrong, or `USER_SERVICE_URL` points somewhere that is not user.auth.sso |
 | Subscription/plan calls 400, billing calls fine | `SUBSCRIPTION_SERVICE_PUBLISHABLE_API_KEY` missing |
 | APISIX returns 404 | routes were never seeded, or seeded into a different APISIX — `make routes`. A successful ArgoCD sync does **not** seed them |

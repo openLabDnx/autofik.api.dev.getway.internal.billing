@@ -8,7 +8,7 @@
 # KUBECONFIG (on the RKE2 host: /etc/rancher/rke2/rke2.yaml) to pick another.
 
 KUBECTL ?= kubectl
-NAMESPACE ?= default
+NAMESPACE ?= billing-gateway
 APISIX_NAMESPACE ?= apisix
 APISIX_ADMIN_PORT ?= 9180
 APISIX_HOSTNAME ?= apisix.master.autofik.com
@@ -23,9 +23,10 @@ DASH_USER ?= admin
 APISIX_ADMIN_KEY_FILE ?= ../../api/ansible/.secrets/apisix_admin_key
 APISIX_ADMIN_KEY ?= $(shell [ -f "$(APISIX_ADMIN_KEY_FILE)" ] && tr -d "[:space:]" < "$(APISIX_ADMIN_KEY_FILE)")
 
-.PHONY: help secret deploy all undeploy restart status logs port-forward routes routes-delete routes-dashboard verify
+.PHONY: help namespace secret deploy all undeploy restart status logs port-forward routes routes-delete routes-dashboard verify
 
 help:
+	@echo "namespace     create the $(NAMESPACE) namespace (idempotent)"
 	@echo "secret        apply secret.yml (copy it from secret.example.yml first)"
 	@echo "deploy        apply the ConfigMap/Deployment/Service"
 	@echo "all           secret + deploy + routes"
@@ -40,10 +41,14 @@ help:
 	@echo "verify        curl the public health route through APISIX"
 
 # The Deployment consumes this Secret via envFrom, so it must exist before
-# the pod can start - apply it first, not after.
-secret:
+# the pod can start - apply it first, not after. The namespace has to exist
+# before anything can go into it, so ensure it here as well (idempotent).
+secret: namespace
 	@test -f secret.yml || { echo "secret.yml not found - cp secret.example.yml secret.yml and fill it in"; exit 1; }
 	$(KUBECTL) apply -f secret.yml
+
+namespace:
+	$(KUBECTL) create namespace $(NAMESPACE) --dry-run=client -o yaml | $(KUBECTL) apply -f -
 
 deploy:
 	$(KUBECTL) apply -k .

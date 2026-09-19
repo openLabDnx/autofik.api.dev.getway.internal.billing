@@ -20,7 +20,7 @@
 #   DASH_URL            required, e.g. https://apisix.master.autofik.com
 #   DASH_USER           default admin
 #   DASH_PASS           required
-#   UPSTREAM_NODE       default billing-getway-internal.default.svc.cluster.local:8081
+#   UPSTREAM_NODE       default billing-getway-internal.billing-gateway.svc.cluster.local:8081
 #   ADMIN_ALLOW_CIDRS   optional, comma-separated; wraps the admin route in
 #                       ip-restriction so only these CIDRs can call it.
 set -euo pipefail
@@ -28,7 +28,7 @@ set -euo pipefail
 DASH_URL="${DASH_URL:-}"
 DASH_USER="${DASH_USER:-admin}"
 DASH_PASS="${DASH_PASS:-}"
-UPSTREAM_NODE="${UPSTREAM_NODE:-billing-getway-internal.default.svc.cluster.local:8081}"
+UPSTREAM_NODE="${UPSTREAM_NODE:-billing-getway-internal.billing-gateway.svc.cluster.local:8081}"
 ADMIN_ALLOW_CIDRS="${ADMIN_ALLOW_CIDRS:-}"
 
 UPSTREAM_ID="billing-getway-internal"
