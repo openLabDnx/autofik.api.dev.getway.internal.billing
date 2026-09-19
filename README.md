@@ -26,6 +26,7 @@ generated from the `google.api.http` options in `billing.proto`.
 | `secret.example.yml` | template for the two downstream API keys |
 | `kustomization.yaml` | what `kubectl apply -k .` applies |
 | `apisix/seed-routes.sh` | writes the upstream + routes through the APISIX Admin API |
+| `apisix/seed-routes-dashboard.sh` | the same objects through the published dashboard, for a cluster you have no kubeconfig for |
 | `Makefile` | the commands below |
 
 ## Deploy
@@ -67,6 +68,13 @@ make verify                              # 200 from /mobile/v1/health through AP
 
 ## APISIX routes
 
+> **ArgoCD does not create these routes.** The Application syncs
+> `kustomization.yaml`, which contains only the ConfigMap, Deployment and
+> Service. The routes are etcd entries written by a shell script, so a green
+> ArgoCD sync tells you nothing about whether the gateway is reachable — an
+> APISIX dashboard with no `billing-getway-*` routes is the expected state
+> until you seed them by hand. Seed **after** the Application has synced.
+
 `apisix/seed-routes.sh` writes three objects through the Admin API. APISIX
 runs in `traditional` role with etcd as its config provider, so routes are
 etcd entries, not Kubernetes objects — there is no CRD to `kubectl apply`.
@@ -86,6 +94,24 @@ exactly as `billing.proto` declares it, so there is no `proxy-rewrite`.
 `/internal/v1/token/verify` is **not** routed. It is for in-cluster callers
 (e.g. the subscription service resolving a caller's identity); they reach it
 on the ClusterIP Service directly, never through the edge.
+
+### Seeding a cluster you have no kubeconfig for
+
+`make routes` needs a port-forward, and the Admin API's `allow_admin` is
+`127.0.0.1/24`, so without cluster credentials there is nothing to forward.
+The dashboard is published over HTTPS, speaks the same `/apisix/admin/*`
+paths and writes to the same etcd — it just authenticates with a JWT:
+
+```bash
+make routes-dashboard DASH_PASS=<dashboard password>
+
+# other cluster, or removal
+make routes-dashboard DASH_URL=https://apisix.testing.autofik.com DASH_PASS=...
+make routes-dashboard DASH_PASS=... ARGS=--delete
+```
+
+The dashboard login is `admin`. `apisix` is the Kubernetes namespace, not a
+user — logging in as `apisix` fails with "username or password error".
 
 ### Locking down the admin route
 
@@ -149,6 +175,8 @@ deliberate, not a typo here.)
 | Pod stuck in `CreateContainerConfigError` | `secret.yml` was never applied — run `make secret` |
 | Every request 401s with a valid token | `USER_SERVICE_PUBLISHABLE_API_KEY` missing/wrong, or `USER_SERVICE_URL` points somewhere that is not user.auth.sso |
 | Subscription/plan calls 400, billing calls fine | `SUBSCRIPTION_SERVICE_PUBLISHABLE_API_KEY` missing |
-| APISIX returns 404 | routes were never seeded, or seeded into a different APISIX — `make routes` |
+| APISIX returns 404 | routes were never seeded, or seeded into a different APISIX — `make routes`. A successful ArgoCD sync does **not** seed them |
+| Dashboard shows no routes after an ArgoCD deploy | expected — ArgoCD only syncs the workload; run `make routes` or `make routes-dashboard` |
+| Admin API returns 401 | the key in `api/ansible/.secrets/apisix_admin_key` is not the key that cluster runs; check `kubectl -n apisix get cm apisix -o yaml` under `deployment.admin.admin_key` |
 | APISIX returns 503 | upstream node name does not resolve; check `make status` shows endpoints |
 | Auth works for some users, fails for others | known upstream issue: user.auth.sso's `GET /api/user/verify-token` returns *every* verify-token row unfiltered, and the gateway reads `data[0]`. It is only correct while that table holds a single active record — see the note in `middleware/user_auth.go` |

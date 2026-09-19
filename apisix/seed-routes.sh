@@ -209,4 +209,4 @@ EOF
 )"
 
 echo "Done. Smoke test (no token needed on the health route):"
-echo "  curl https://apisix.testing.autofik.com/mobile/v1/health"
+echo "  curl https://apisix.master.autofik.com/mobile/v1/health"

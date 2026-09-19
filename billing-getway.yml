@@ -31,8 +31,8 @@ data:
   # user-auth-sso Services are actually called in this namespace, or to an
   # external URL if a service still runs outside the cluster.
   BILLING_SERVICE_URL: "http://billing.default.svc.cluster.local:4041"
-  SUBSCRIPTION_SERVICE_URL: "http://subscription.default.svc.cluster.local:4040"
-  USER_SERVICE_URL: "http://user-auth-sso.default.svc.cluster.local:4000"
+  SUBSCRIPTION_SERVICE_URL: "http://subscription.subscription.svc.cluster.local:4040"
+  USER_SERVICE_URL: "http://sso.default.svc.cluster.local:4000"
 
   # GET route on the user service that returns verify-token records. The
   # UserServiceVerifier appends this to USER_SERVICE_URL on every request.
@@ -75,6 +75,12 @@ spec:
             - name: http-gw
               containerPort: 8081
           envFrom:
+            # Publishable API keys for user.auth.sso and the subscription
+            # service. Not optional: without them verify-token answers 401 and
+            # every request through this gateway fails as "invalid token".
+            # secret.yml is gitignored - apply it with `make secret` first.
+            - secretRef:
+                name: billing-getway-internal
             - configMapRef:
                 name: billing-getway-internal
           # /healty (sic - that is the route the binary serves) is mounted
