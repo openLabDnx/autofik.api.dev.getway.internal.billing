@@ -23,7 +23,7 @@ DASH_USER ?= admin
 APISIX_ADMIN_KEY_FILE ?= ../../api/ansible/.secrets/apisix_admin_key
 APISIX_ADMIN_KEY ?= $(shell [ -f "$(APISIX_ADMIN_KEY_FILE)" ] && tr -d "[:space:]" < "$(APISIX_ADMIN_KEY_FILE)")
 
-.PHONY: help namespace secret fix-secret deploy all undeploy restart status logs port-forward routes routes-delete routes-dashboard verify tf-init tf-plan tf-apply tf-state-namespace
+.PHONY: help namespace secret fix-secret deploy all undeploy restart status logs port-forward routes routes-delete routes-dashboard verify tf-init tf-plan tf-apply tf-show tf-state-namespace
 
 help:
 	@echo "namespace     create the $(NAMESPACE) namespace (idempotent)"
@@ -41,9 +41,13 @@ help:
 	@echo "routes-dashboard  seed the routes through the published dashboard (no kubeconfig needed)"
 	@echo "verify        curl the public health route through APISIX"
 	@echo ""
-	@echo "tf-init       terraform init (state lives in a Secret in the cluster)"
-	@echo "tf-plan       show what deploying IMAGE_TAG=<tag> would change"
-	@echo "tf-apply      point the ArgoCD Application at IMAGE_TAG=<tag>"
+	@echo "Terraform (per environment - ENV=dev|stg|prod, KUBECONFIG picks the cluster):"
+	@echo "tf-init       terraform init for ENV (state is a Secret in that cluster)"
+	@echo "tf-plan       show what deploying IMAGE_TAG=<tag> to ENV would change"
+	@echo "tf-apply      point ENV's ArgoCD Application at IMAGE_TAG=<tag>"
+	@echo "tf-show       what is currently pinned in ENV"
+	@echo ""
+	@echo "  make tf-init ENV=prod && make tf-apply ENV=prod IMAGE_TAG=prod-1.2.3"
 
 # The Deployment consumes this Secret via envFrom, so it must exist before
 # the pod can start - apply it first, not after. The namespace has to exist
@@ -128,15 +132,26 @@ verify:
 	curl -fsS "https://$(APISIX_HOSTNAME)/mobile/v1/health" && echo
 
 # ---------------------------------------------------------------------------
-# Terraform - the release-triggered deploy
+# Terraform - the release-triggered deploy, per environment
 #
-# Terraform owns ONLY the ArgoCD Application, whose kustomize image override
-# pins which image tag ArgoCD rolls out. It does not manage the Deployment;
-# the Application's selfHeal would just revert it. Normally CI runs this on a
-# repository_dispatch from the app repo - these targets are for doing it by
-# hand (a rollback, or the first run).
+# Terraform owns ONLY the ArgoCD Application, whose kustomize overrides pin
+# which image tag ArgoCD rolls out and how many replicas it runs. It does not
+# manage the Deployment; the Application's selfHeal would just revert it.
 #
-#   make tf-apply IMAGE_TAG=dev-1.2.3
+# dev, stg and prod are three separate clusters, each with its own ArgoCD and
+# its own Terraform state. Every target below therefore needs BOTH:
+#
+#   ENV=<dev|stg|prod>   picks the state Secret and the release channel
+#   KUBECONFIG=<path>    picks the cluster
+#
+# Get those two out of step and you would deploy to the wrong cluster, so
+# `tf-apply` prints the context it is about to write to and, for prod, asks
+# first. Normally CI does all of this on a repository_dispatch from the app
+# repo - these targets are for doing it by hand (a rollback, or the first run).
+#
+#   make tf-init  ENV=prod
+#   make tf-plan  ENV=prod IMAGE_TAG=prod-1.2.3
+#   make tf-apply ENV=prod IMAGE_TAG=prod-1.2.3
 # ---------------------------------------------------------------------------
 
 TF ?= terraform
@@ -144,17 +159,59 @@ TF_DIR ?= terraform
 KUBECONFIG_PATH ?= $(if $(KUBECONFIG),$(KUBECONFIG),$(HOME)/.kube/config)
 TF_STATE_NAMESPACE ?= terraform-state
 
+# Every tf-* target funnels through this, so a typo in ENV can never reach a
+# cluster. The tfvars file has to exist too - that is what makes `ENV=prod`
+# mean "the settings in envs/prod.tfvars" rather than just a string.
+define require_env
+@test -n "$(ENV)" || { echo "ENV is required: make $@ ENV=dev|stg|prod"; exit 1; }
+@test -f "$(TF_DIR)/envs/$(ENV).tfvars" || { echo "unknown ENV '$(ENV)' - no $(TF_DIR)/envs/$(ENV).tfvars (expected dev, stg or prod)"; exit 1; }
+endef
+
+# One state Secret per environment. This suffix is the ONLY thing keeping the
+# three states apart, so it is derived from ENV and never typed by hand.
+TF_STATE_SUFFIX = billing-getway-$(ENV)
+
+TF_VARS = -var-file="envs/$(ENV).tfvars" -var="kubeconfig_path=$(KUBECONFIG_PATH)"
+
 # The kubernetes backend stores a Secret but will not create its namespace.
 tf-state-namespace:
-	$(KUBECTL) create namespace $(TF_STATE_NAMESPACE) --dry-run=client -o yaml | $(KUBECTL) apply -f -
+	$(KUBECTL) --kubeconfig="$(KUBECONFIG_PATH)" create namespace $(TF_STATE_NAMESPACE) --dry-run=client -o yaml \
+	  | $(KUBECTL) --kubeconfig="$(KUBECONFIG_PATH)" apply -f -
 
-tf-init: tf-state-namespace
-	cd $(TF_DIR) && $(TF) init -input=false -backend-config="config_path=$(KUBECONFIG_PATH)"
+# -reconfigure, not -migrate-state: switching ENV points at a DIFFERENT state
+# that already exists. Without it Terraform offers to copy dev's state over
+# prod's, which is exactly the accident this layout exists to prevent.
+tf-init:
+	$(require_env)
+	@$(MAKE) --no-print-directory tf-state-namespace ENV=$(ENV)
+	cd $(TF_DIR) && $(TF) init -input=false -reconfigure \
+	  -backend-config="config_path=$(KUBECONFIG_PATH)" \
+	  -backend-config="secret_suffix=$(TF_STATE_SUFFIX)"
 
 tf-plan:
-	@test -n "$(IMAGE_TAG)" || { echo "IMAGE_TAG is required, e.g. make tf-plan IMAGE_TAG=dev-1.2.3"; exit 1; }
-	cd $(TF_DIR) && $(TF) plan -input=false -var="image_tag=$(IMAGE_TAG)" -var="kubeconfig_path=$(KUBECONFIG_PATH)"
+	$(require_env)
+	@test -n "$(IMAGE_TAG)" || { echo "IMAGE_TAG is required, e.g. make tf-plan ENV=$(ENV) IMAGE_TAG=$(ENV)-1.2.3"; exit 1; }
+	cd $(TF_DIR) && $(TF) plan -input=false $(TF_VARS) -var="image_tag=$(IMAGE_TAG)"
 
+# Prints the cluster before it writes anything, because ENV and KUBECONFIG are
+# set independently and nothing else would catch a mismatch. Pass YES=1 to
+# skip the prompt (CI does).
 tf-apply:
-	@test -n "$(IMAGE_TAG)" || { echo "IMAGE_TAG is required, e.g. make tf-apply IMAGE_TAG=dev-1.2.3"; exit 1; }
-	cd $(TF_DIR) && $(TF) apply -input=false -var="image_tag=$(IMAGE_TAG)" -var="kubeconfig_path=$(KUBECONFIG_PATH)"
+	$(require_env)
+	@test -n "$(IMAGE_TAG)" || { echo "IMAGE_TAG is required, e.g. make tf-apply ENV=$(ENV) IMAGE_TAG=$(ENV)-1.2.3"; exit 1; }
+	@echo "environment : $(ENV)"
+	@echo "image tag   : $(IMAGE_TAG)"
+	@echo "state secret: tfstate-default-$(TF_STATE_SUFFIX) (ns $(TF_STATE_NAMESPACE))"
+	@echo "kubeconfig  : $(KUBECONFIG_PATH)"
+	@echo "context     : $$($(KUBECTL) --kubeconfig="$(KUBECONFIG_PATH)" config current-context 2>/dev/null || echo '<none>')"
+	@echo "cluster     : $$($(KUBECTL) --kubeconfig="$(KUBECONFIG_PATH)" config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || echo '<none>')"
+	@test -n "$(YES)" || { \
+	  printf 'Deploy %s to %s? [y/N] ' "$(IMAGE_TAG)" "$(ENV)"; \
+	  read ans; [ "$$ans" = y ] || [ "$$ans" = Y ] || { echo aborted; exit 1; }; \
+	}
+	cd $(TF_DIR) && $(TF) apply -input=false -auto-approve $(TF_VARS) -var="image_tag=$(IMAGE_TAG)"
+
+# What is live in one environment, straight from its state.
+tf-show:
+	$(require_env)
+	cd $(TF_DIR) && $(TF) output

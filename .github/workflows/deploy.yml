@@ -1,9 +1,19 @@
-# Roll out a released image.
+# Roll out a released image to dev, stg or prod.
 #
-# The app repo (autofik.dev.api.billing.getway.internal) builds and pushes
-# the image on a `dev-v*` tag, then fires a repository_dispatch here with the
-# immutable tag it published. Terraform rewrites the ArgoCD Application's
-# kustomize image override, and ArgoCD does the actual rollout.
+# The app repo (autofik.dev.api.billing.getway.internal) builds and pushes the
+# image on a `<channel>-v*` tag, then fires a repository_dispatch here with the
+# immutable tag it published. Terraform rewrites that environment's ArgoCD
+# Application (image + replica overrides), and ArgoCD does the actual rollout.
+#
+# WHICH ENVIRONMENT IS NOT AN INPUT. It is derived from the image tag's channel
+# prefix - dev-1.2.3 deploys to dev, prod-1.2.3 deploys to prod - so there is
+# no way to send a dev build to production by picking the wrong dropdown, and
+# Terraform re-checks the same rule before it writes anything.
+#
+# Each environment is its own cluster with its own ArgoCD and its own Terraform
+# state, and each has a matching GitHub Environment (dev / stg / prod) holding
+# that cluster's KUBECONFIG_B64. `prod` is the one with required reviewers, so
+# a production deploy pauses for approval before any step below runs.
 #
 # Nothing in this workflow touches the Deployment directly - if it did, the
 # Application's `selfHeal: true` would revert it within ~3 minutes.
@@ -13,36 +23,49 @@ on:
   repository_dispatch:
     types: [deploy-image]
 
-  # Same path by hand, for a rollback or a re-deploy.
+  # Same path by hand, for a rollback or a re-deploy. There is deliberately no
+  # environment picker: the tag decides.
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Immutable image tag, e.g. dev-1.2.3 (NOT the git tag dev-v1.2.3)"
+        description: "Immutable image tag, e.g. prod-1.2.3 (NOT the git tag prod-v1.2.3). The prefix selects the environment."
         required: true
         type: string
 
-# Two applies at once would collide on the Terraform state lock, and the
-# second would fail rather than queue. Serialise them instead; never cancel a
-# run mid-apply, which can leave the lock held.
-concurrency:
-  group: deploy-billing-getway
-  cancel-in-progress: false
+# The job below needs nothing from the repo but its own contents.
+permissions:
+  contents: read
 
 jobs:
-  deploy:
+  # Runs with no environment and no secrets, so the untrusted dispatch payload
+  # is parsed and rejected before anything holding a kubeconfig starts.
+  resolve:
+    name: Resolve tag and environment
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    outputs:
+      image_tag: ${{ steps.resolve.outputs.image_tag }}
+      environment: ${{ steps.resolve.outputs.environment }}
 
     steps:
-      - name: Checkout deploy repository
-        uses: actions/checkout@v7
-
-      - name: Resolve the image tag
+      # Every untrusted value arrives through `env:`, never interpolated into
+      # the script body - `${{ }}` is substituted as text before bash parses
+      # the line, so a payload containing a quote would otherwise run as code
+      # on a runner that is about to hold cluster credentials.
+      - name: Resolve the image tag and its environment
         id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.image_tag }}
+          DISPATCH_TAG: ${{ github.event.client_payload.image_tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG='${{ inputs.image_tag }}'
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="${INPUT_TAG:-}"
           else
-            TAG='${{ github.event.client_payload.image_tag }}'
+            TAG="${DISPATCH_TAG:-}"
           fi
 
           if [ -z "$TAG" ]; then
@@ -50,39 +73,96 @@ jobs:
             exit 1
           fi
 
-          echo "IMAGE_TAG=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Deploying image tag: $TAG"
+          # The same rule Terraform enforces, applied here so a malformed tag
+          # fails in five seconds instead of after a kubeconfig and a "deploy
+          # started" notification have gone out. Mind the two tag shapes: the
+          # git tag is prod-v1.2.3, the image tag it produces is prod-1.2.3.
+          if ! printf '%s' "$TAG" | grep -Eq '^(dev|stg|prod)-[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Image tag '$TAG' is not a released tag. Expected <dev|stg|prod>-<major>.<minor>.<patch>, e.g. prod-1.2.3 (no 'v')."
+            exit 1
+          fi
+
+          ENVIRONMENT="${TAG%%-*}"
+
+          echo "image_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+
+          echo "### Deploy \`$TAG\` to \`$ENVIRONMENT\`" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy to ${{ needs.resolve.outputs.environment }}
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    # This is the approval gate and the credential boundary in one. The GitHub
+    # Environment named here supplies KUBECONFIG_B64 for its own cluster, and
+    # `prod`'s required reviewers hold the job before its first step.
+    environment: ${{ needs.resolve.outputs.environment }}
+
+    # Per environment, so a prod deploy never queues behind a dev one. Two
+    # applies against the same state would collide on the Terraform lock and
+    # the second would fail rather than queue, so same-environment runs are
+    # serialised - and never cancelled mid-apply, which can leave the lock
+    # held.
+    concurrency:
+      group: deploy-billing-getway-${{ needs.resolve.outputs.environment }}
+      cancel-in-progress: false
+
+    env:
+      IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
+      TF_ENV: ${{ needs.resolve.outputs.environment }}
+
+    steps:
+      - name: Checkout deploy repository
+        uses: actions/checkout@v7
 
       - name: Notify deploy started
         env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          ACTOR: ${{ github.actor }}
         run: |
           curl -s -X POST \
-          https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage \
-          -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
-          ${TELEGRAM_MESSAGE_THREAD_ID:+-d message_thread_id="$TELEGRAM_MESSAGE_THREAD_ID"} \
-          -d parse_mode=HTML \
-          -d text=$'🚢 <b>Deploy Started</b>\n\nService: billing-getway-internal\nImage tag: ${{ steps.resolve.outputs.IMAGE_TAG }}\n\nTriggered by: ${{ github.actor }}'
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="$TELEGRAM_CHAT_ID" \
+            ${TELEGRAM_MESSAGE_THREAD_ID:+-d message_thread_id="$TELEGRAM_MESSAGE_THREAD_ID"} \
+            -d parse_mode=HTML \
+            --data-urlencode "text=🚢 <b>Deploy Started</b>
 
-      # The kubeconfig for the cluster ArgoCD runs in, base64-encoded so it
+          Service: billing-getway-internal
+          Environment: <b>${TF_ENV}</b>
+          Image tag: ${IMAGE_TAG}
+
+          Triggered by: ${ACTOR}"
+
+      # The kubeconfig for THIS environment's cluster, base64-encoded so it
       # survives being a single-line secret:
       #   base64 -w0 /etc/rancher/rke2/rke2.yaml
       # Its server: address must be reachable from a GitHub runner, so the
       # 127.0.0.1 that RKE2 writes has to be replaced with the public address.
+      # It is an Environment secret, not a repo secret - that is what keeps the
+      # prod kubeconfig unreachable from a dev deploy.
       - name: Write kubeconfig
         env:
           KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
         run: |
-          if [ -z "$KUBECONFIG_B64" ]; then
-            echo "::error::Secret KUBECONFIG_B64 is not set on this repository."
+          set -euo pipefail
+          if [ -z "${KUBECONFIG_B64:-}" ]; then
+            echo "::error::Secret KUBECONFIG_B64 is not set on the '${TF_ENV}' GitHub Environment."
             exit 1
           fi
           printf '%s' "$KUBECONFIG_B64" | base64 -d > "$RUNNER_TEMP/kubeconfig"
           chmod 600 "$RUNNER_TEMP/kubeconfig"
+
+          echo "--- cluster this run will write to ---"
+          kubectl --kubeconfig="$RUNNER_TEMP/kubeconfig" config view --minify \
+            -o jsonpath='{.clusters[0].cluster.server}{"\n"}'
           kubectl --kubeconfig="$RUNNER_TEMP/kubeconfig" version -o yaml | head -5
 
       # The kubernetes state backend stores a Secret but will not create the
-      # namespace holding it, so the very first run needs this.
+      # namespace holding it, so the very first run per cluster needs this.
       - name: Ensure the Terraform state namespace exists
         run: |
           kubectl --kubeconfig="$RUNNER_TEMP/kubeconfig" create namespace terraform-state \
@@ -92,74 +172,161 @@ jobs:
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
+          # Pinned: variables.tf uses cross-variable validation, which needs
+          # >= 1.9, and an unpinned "latest" makes CI non-reproducible.
+          terraform_version: 1.16.2
           terraform_wrapper: false
 
+      # secret_suffix is what separates the three states. It is derived from
+      # the channel prefix of the tag, exactly like the environment itself, so
+      # the state and the cluster can never disagree about which environment
+      # this is.
       - name: Terraform init
         working-directory: terraform
         run: |
-          terraform init -input=false \
-            -backend-config="config_path=$RUNNER_TEMP/kubeconfig"
+          set -euo pipefail
+          terraform init -input=false -reconfigure \
+            -backend-config="config_path=$RUNNER_TEMP/kubeconfig" \
+            -backend-config="secret_suffix=billing-getway-${TF_ENV}"
 
       - name: Terraform apply
+        id: tf
         working-directory: terraform
         run: |
+          set -euo pipefail
           terraform apply -input=false -auto-approve \
-            -var="image_tag=${{ steps.resolve.outputs.IMAGE_TAG }}" \
+            -var-file="envs/${TF_ENV}.tfvars" \
+            -var="image_tag=${IMAGE_TAG}" \
             -var="kubeconfig_path=$RUNNER_TEMP/kubeconfig"
 
-      # Terraform returns as soon as the Application spec is written, which is
-      # before ArgoCD has rolled anything out. Without this the job goes green
-      # while the new pods are still starting - or still crash-looping.
-      - name: Wait for ArgoCD to sync and report healthy
+          {
+            echo "image=$(terraform output -raw deployed_image)"
+            echo "app_name=$(terraform output -raw app_name)"
+            echo "argocd_namespace=$(terraform output -raw argocd_namespace)"
+            echo "namespace=$(terraform output -raw dest_namespace)"
+            echo "replicas=$(terraform output -raw replicas)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Wait for ArgoCD to roll the new image out
+        env:
+          EXPECTED_IMAGE: ${{ steps.tf.outputs.image }}
+          APP: ${{ steps.tf.outputs.app_name }}
+          ARGOCD_NS: ${{ steps.tf.outputs.argocd_namespace }}
+          NS: ${{ steps.tf.outputs.namespace }}
         run: |
+          set -euo pipefail
           export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
 
-          kubectl -n argocd wait --timeout=300s \
-            --for=jsonpath='{.status.sync.status}'=Synced \
-            application/billing-getway-internal
+          # `terraform apply` returns as soon as the Application spec is
+          # written, which is before ArgoCD has reacted to it. For those few
+          # seconds the Application still reports Synced/Healthy from the
+          # PREVIOUS release - so waiting on its status directly can pass
+          # against stale status and take the job green without anything
+          # having been deployed. Wait for the Deployment to actually carry
+          # the new image first; only then is there a rollout worth watching.
+          echo "waiting for the Deployment to pick up $EXPECTED_IMAGE"
+          for i in $(seq 1 60); do
+            live="$(kubectl -n "$NS" get deployment "$APP" \
+              -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+            if [ "$live" = "$EXPECTED_IMAGE" ]; then
+              echo "ArgoCD applied it after ~$((i * 5))s"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "::error::ArgoCD did not apply $EXPECTED_IMAGE within 5m (Deployment is still on ${live:-<none>})."
+              exit 1
+            fi
+            sleep 5
+          done
 
-          kubectl -n argocd wait --timeout=300s \
+          kubectl -n "$NS" rollout status deployment/"$APP" --timeout=300s
+
+          kubectl -n "$ARGOCD_NS" wait --timeout=120s \
             --for=jsonpath='{.status.health.status}'=Healthy \
-            application/billing-getway-internal
+            application/"$APP"
 
           echo "--- running images ---"
-          kubectl -n billing-gateway get deployment billing-getway-internal \
+          kubectl -n "$NS" get deployment "$APP" \
             -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}'
+
+      - name: Summary
+        if: success()
+        env:
+          EXPECTED_IMAGE: ${{ steps.tf.outputs.image }}
+          REPLICAS: ${{ steps.tf.outputs.replicas }}
+        run: |
+          {
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Environment | \`${TF_ENV}\` |"
+            echo "| Image | \`${EXPECTED_IMAGE}\` |"
+            echo "| Replicas | ${REPLICAS} |"
+            echo "| Status | Synced / Healthy |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Report what went wrong
         if: failure()
+        env:
+          APP: ${{ steps.tf.outputs.app_name }}
+          ARGOCD_NS: ${{ steps.tf.outputs.argocd_namespace }}
+          NS: ${{ steps.tf.outputs.namespace }}
         run: |
           export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
-          echo "--- application ---"
-          kubectl -n argocd get application billing-getway-internal -o wide || true
+          # These fall back to the defaults because a failure in `terraform
+          # apply` itself leaves the step outputs above unset.
+          APP="${APP:-billing-getway-internal}"
+          ARGOCD_NS="${ARGOCD_NS:-argocd}"
+          NS="${NS:-billing-gateway}"
+
+          echo "--- application ($TF_ENV) ---"
+          kubectl -n "$ARGOCD_NS" get application "$APP" -o wide || true
           echo "--- conditions ---"
-          kubectl -n argocd get application billing-getway-internal \
+          kubectl -n "$ARGOCD_NS" get application "$APP" \
             -o jsonpath='{range .status.conditions[*]}{.type}: {.message}{"\n"}{end}' || true
           echo "--- pods ---"
-          kubectl -n billing-gateway get pods -o wide || true
+          kubectl -n "$NS" get pods -o wide || true
           echo "--- recent events ---"
-          kubectl -n billing-gateway get events --sort-by=.lastTimestamp | tail -20 || true
+          kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -20 || true
 
       - name: Notify success
         if: success()
         env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          EXPECTED_IMAGE: ${{ steps.tf.outputs.image }}
+          REPLICAS: ${{ steps.tf.outputs.replicas }}
         run: |
           curl -s -X POST \
-          https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage \
-          -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
-          ${TELEGRAM_MESSAGE_THREAD_ID:+-d message_thread_id="$TELEGRAM_MESSAGE_THREAD_ID"} \
-          -d parse_mode=HTML \
-          -d text=$'✅ <b>Deploy Success</b>\n\nService: billing-getway-internal\nImage tag: ${{ steps.resolve.outputs.IMAGE_TAG }}\nArgoCD: Synced / Healthy'
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="$TELEGRAM_CHAT_ID" \
+            ${TELEGRAM_MESSAGE_THREAD_ID:+-d message_thread_id="$TELEGRAM_MESSAGE_THREAD_ID"} \
+            -d parse_mode=HTML \
+            --data-urlencode "text=✅ <b>Deploy Success</b>
+
+          Service: billing-getway-internal
+          Environment: <b>${TF_ENV}</b>
+          Image: ${EXPECTED_IMAGE}
+          Replicas: ${REPLICAS}
+          ArgoCD: Synced / Healthy"
 
       - name: Notify failure
         if: failure()
         env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           curl -s -X POST \
-          https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage \
-          -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
-          ${TELEGRAM_MESSAGE_THREAD_ID:+-d message_thread_id="$TELEGRAM_MESSAGE_THREAD_ID"} \
-          -d parse_mode=HTML \
-          -d text=$'❌ <b>Deploy Failed</b>\n\nService: billing-getway-internal\nImage tag: ${{ steps.resolve.outputs.IMAGE_TAG }}\n\nCheck GitHub Actions logs.'
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="$TELEGRAM_CHAT_ID" \
+            ${TELEGRAM_MESSAGE_THREAD_ID:+-d message_thread_id="$TELEGRAM_MESSAGE_THREAD_ID"} \
+            -d parse_mode=HTML \
+            --data-urlencode "text=❌ <b>Deploy Failed</b>
+
+          Service: billing-getway-internal
+          Environment: <b>${TF_ENV}</b>
+          Image tag: ${IMAGE_TAG}
+
+          ${RUN_URL}"

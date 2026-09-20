@@ -1,27 +1,32 @@
-# ArgoCD Application for the master cluster (apisix.master.autofik.com).
+# ArgoCD Application for the billing gateway - BOOTSTRAP ONLY.
 #
-# This is what makes the billing gateway WORKLOAD (ConfigMap + Deployment +
-# Service) run in the master cluster. Apply it once in the master cluster's
-# argocd namespace - ArgoCD then syncs the kustomize root of this repo and
-# keeps it in sync (prune + selfHeal).
+# dev, stg and prod are three separate clusters, each running its own ArgoCD.
+# This one file is what you apply in EACH of them to create the Application the
+# first time; there is nothing environment-specific in it, because the cluster
+# you apply it to is what decides the environment.
 #
-#   kubectl apply -f argocd-application.yaml        # needs master kube/ArgoCD access
+#   kubectl --kubeconfig=<that cluster> apply -f argocd-application.yaml
 #   # or: argocd app create -f argocd-application.yaml
 #   # or: paste into the ArgoCD UI (New App -> Edit as YAML)
 #
-# NOTE: this does NOT create the APISIX routes - those live in the master
-# APISIX's etcd and are added through the dashboard / Admin API (see the
-# repo README and apisix/seed-routes.sh). Do the routes AFTER this syncs.
-# BOOTSTRAP ONLY once Terraform is in use. terraform/ manages this same
-# Application and additionally pins `spec.source.kustomize.images` to the
-# released image tag. Applying this file by hand after that point wipes the
-# pin, and ArgoCD falls back to whatever :master happens to be - which is the
-# problem the Terraform setup exists to solve.
+# Applying this deploys whatever `:master` currently points at - a moving tag.
+# That is fine for the very first sync and wrong from then on, which is what
+# terraform/ exists to fix: it manages this same Application and additionally
+# pins `spec.source.kustomize.images` to the released tag and
+# `spec.source.kustomize.replicas` to the environment's replica count.
 #
-# Use it to create the Application the first time (or on a cluster with no
-# Terraform), then hand ownership over:
-#   terraform import kubernetes_manifest.billing_gateway_app \
+# So once Terraform owns an environment, do NOT apply this file to that cluster
+# again - it would wipe both pins and ArgoCD would fall back to :master.
+#
+# Hand each cluster over after its first sync (per environment):
+#   export KUBECONFIG=<that cluster's kubeconfig>
+#   make tf-init ENV=prod
+#   cd terraform && terraform import kubernetes_manifest.billing_gateway_app \
 #     "apiVersion=argoproj.io/v1alpha1,kind=Application,namespace=argocd,name=billing-getway-internal"
+#
+# NOTE: this does NOT create the APISIX routes - those live in that cluster's
+# APISIX etcd and are added through the dashboard / Admin API (see the repo
+# README and apisix/seed-routes.sh). Do the routes AFTER this syncs.
 #
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -38,8 +43,9 @@ spec:
     path: .
 
   destination:
-    # The cluster ArgoCD itself runs in (the master cluster). Change only if
-    # ArgoCD manages master as a remote/external cluster under another name.
+    # The cluster ArgoCD itself runs in. Correct in all three environments,
+    # because each has its own ArgoCD. Change only if one of them manages
+    # another cluster as a remote/external one under a different name.
     server: https://kubernetes.default.svc
     # The manifests hardcode `namespace: billing-gateway`; keep this in sync.
     namespace: billing-gateway

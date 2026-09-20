@@ -1,10 +1,13 @@
 # Real API keys - only secret.example.yml belongs in git.
 secret.yml
 
-# Terraform: local state, provider plugins and lock-free local overrides.
-# The real state lives in a Secret in the cluster (see terraform/versions.tf),
-# so nothing here should ever be committed. .terraform.lock.hcl is the one
-# exception - it IS committed, to pin provider versions across machines.
+# Terraform: local state, provider plugins and machine-specific overrides.
+# The real state lives in a Secret in each cluster (see terraform/versions.tf),
+# so nothing here should ever be committed. Two exceptions, both committed on
+# purpose:
+#   terraform/.terraform.lock.hcl  pins provider versions across machines
+#   terraform/envs/*.tfvars        the dev/stg/prod settings - no secrets in
+#                                  them, and CI reads them by name
 terraform/.terraform/
 terraform/*.tfstate
 terraform/*.tfstate.*
