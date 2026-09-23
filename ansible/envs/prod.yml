@@ -1,0 +1,18 @@
+# Production cluster. Loaded when the image tag starts with `prod-`.
+#
+# Which kubeconfig to use, first match wins:
+#   -e kubeconfig_path=...  >  $KUBECONFIG_PROD  >  $KUBECONFIG  >  ~/.kube/config
+#
+# Setting KUBECONFIG_PROD is the safer habit: with only KUBECONFIG, a shell
+# left pointing at dev would send a prod- tag at the dev cluster. Terraform
+# does not catch that for you - it only checks the tag against the tfvars, not
+# against the cluster. The prompt below prints the cluster so you can.
+kubeconfig_path: "{{ lookup('env', 'KUBECONFIG_PROD') or lookup('env', 'KUBECONFIG') or '~/.kube/config' }}"
+
+# Empty means the kubeconfig's current-context.
+kube_context: ""
+
+# The equivalent of the `prod` GitHub Environment's required reviewers: stop
+# and ask. `-e auto_approve=true` skips it; a non-interactive run without that
+# aborts, because an unanswered prompt counts as "no".
+require_confirmation: true

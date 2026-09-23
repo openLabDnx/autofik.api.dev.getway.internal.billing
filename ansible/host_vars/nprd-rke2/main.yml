@@ -1,0 +1,26 @@
+# The non-production RKE2 node that runs the dev cluster. deploy.yml SSHes in
+# as nprdroot and runs terraform and kubectl here, with sudo, because the RKE2
+# kubeconfig is readable by root only.
+#
+# The SSH and sudo password is in secrets.yml next to this file, which is
+# gitignored - copy secrets.yml.example to create it. With an SSH key
+# installed (ssh-copy-id nprdroot@185.252.232.71) only the sudo password is
+# needed.
+
+# Accept the host key on first contact: with password auth there is no
+# terminal to answer the "are you sure" prompt.
+ansible_ssh_common_args: -o StrictHostKeyChecking=accept-new
+
+node_become: true
+
+# Written by RKE2. Its `server:` is 127.0.0.1, which is right here.
+node_kubeconfig_path: /etc/rancher/rke2/rke2.yaml
+node_kubectl_bin: /var/lib/rancher/rke2/bin/kubectl
+
+# Installed by tasks/node.yml when missing or a different version. Keep the
+# version equal to the one .github/workflows/deploy.yml pins.
+node_terraform_bin: /usr/local/bin/terraform
+node_terraform_version: 1.16.2
+
+# Where tasks/node.yml copies ../terraform/ on every run.
+node_tf_dir: /opt/billing-getway/terraform

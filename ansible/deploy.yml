@@ -1,0 +1,386 @@
+# Roll out a released image to dev, stg or prod.
+#
+# The same deploy as .github/workflows/deploy.yml, runnable from this machine
+# with the target cluster's kubeconfig, or over SSH on a cluster node - for a
+# rollback, a first run, or when GitHub Actions is down:
+#
+#   cd ansible
+#   ansible-playbook deploy.yml -e image_tag=prod-1.2.3
+#   ansible-playbook deploy.yml -e image_tag=prod-1.2.2 -e auto_approve=true
+#
+# or `make ansible-deploy IMAGE_TAG=prod-1.2.3` from the repo root.
+#
+# WHICH ENVIRONMENT IS NOT AN INPUT. As in CI it is derived from the image
+# tag's channel prefix, and envs/<env>.yml supplies that environment's
+# kubeconfig. Terraform re-checks the tag against envs/<env>.tfvars.
+#
+# Like CI, this only rewrites the ArgoCD Application through Terraform and
+# then waits for ArgoCD to roll the Deployment. It never touches the
+# Deployment itself - selfHeal would revert that within ~3 minutes.
+#
+# Needs ansible-core here, plus terraform >= 1.9 and kubectl wherever the
+# deploy runs (a node gets terraform installed by tasks/node.yml).
+# Telegram notifications are sent when TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+# are set in the environment (TELEGRAM_MESSAGE_THREAD_ID is optional), and
+# silently skipped when they are not.
+#
+# WHERE IT RUNS comes from inventory.yml: the tag's environment is also an
+# inventory group. A group holding `localhost` runs terraform and kubectl on
+# this machine; a group holding a cluster node (dev: the nprd RKE2 node) runs
+# them on that node over SSH, against its own /etc/rancher/rke2/rke2.yaml -
+# see host_vars/<node>/main.yml.
+
+# The deploy play targets a group named by the tag, and a group that matches
+# no host is silently skipped - so the tag is checked here first, where a bad
+# one fails the run instead.
+- name: Check the image tag
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    image_tag: ""
+
+    # Moving tags are rejected by name first, because they are the common
+    # mistake: they change nothing in the Application spec, so ArgoCD would
+    # deploy nothing. Mind the two tag shapes - the git tag is prod-v1.2.3,
+    # the image tag it produces is prod-1.2.3.
+    moving_tags: [master, testing, production, latest]
+    released_tag_pattern: '^(dev|stg|prod)-[0-9]+\.[0-9]+\.[0-9]+$'
+
+  tasks:
+    - name: Reject a moving tag
+      ansible.builtin.assert:
+        that: image_tag not in moving_tags
+        fail_msg: >-
+          '{{ image_tag }}' is a moving tag. It produces no diff, so ArgoCD
+          would deploy nothing. Use an immutable tag such as dev-1.2.3, or
+          `make restart` to re-pull a moving tag.
+        quiet: true
+
+    - name: Require a released image tag
+      ansible.builtin.assert:
+        that: image_tag is regex(released_tag_pattern)
+        fail_msg: >-
+          Image tag '{{ image_tag }}' is not a released tag. Pass
+          -e image_tag=<dev|stg|prod>-<major>.<minor>.<patch>, e.g. prod-1.2.3
+          (no 'v').
+        quiet: true
+
+    - name: Require a host for the environment
+      ansible.builtin.assert:
+        that: groups[image_tag.split('-') | first] | default([]) | length > 0
+        fail_msg: >-
+          inventory.yml has no host in group '{{ image_tag.split('-') | first }}',
+          so there is nowhere to run the deploy from.
+        quiet: true
+
+- name: Deploy a released billing-getway image
+  # The environment's inventory group - validated by the play above.
+  hosts: "{{ image_tag.split('-') | first }}"
+  gather_facts: false
+  # Cluster nodes set node_become: the RKE2 kubeconfig is root-only.
+  become: "{{ node_become | default(false) }}"
+
+  vars:
+    image_tag: ""
+    auto_approve: false
+
+    repo_root: "{{ playbook_dir | dirname }}"
+    # The node_* settings come from host_vars for a host that is a cluster
+    # node; play vars would override host_vars, hence the indirection.
+    tf_src_dir: "{{ repo_root }}/terraform"
+    tf_dir: "{{ node_tf_dir | default(tf_src_dir) }}"
+    tf_state_namespace: terraform-state
+    terraform_bin: "{{ node_terraform_bin | default('terraform') }}"
+    kubectl_bin: "{{ node_kubectl_bin | default('kubectl') }}"
+
+    telegram_api_url: https://api.telegram.org
+    telegram_bot_token: "{{ lookup('env', 'TELEGRAM_BOT_TOKEN') }}"
+    telegram_chat_id: "{{ lookup('env', 'TELEGRAM_CHAT_ID') }}"
+    telegram_thread_id: "{{ lookup('env', 'TELEGRAM_MESSAGE_THREAD_ID') }}"
+    triggered_by: "{{ lookup('env', 'USER') | default('unknown', true) }} (ansible)"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Resolve and check everything before anything touches a cluster or sends
+    # a "deploy started" message - the counterpart of CI's `resolve` job.
+    # -------------------------------------------------------------------------
+
+    - name: Derive the environment from the tag's channel prefix
+      ansible.builtin.set_fact:
+        deploy_env: "{{ image_tag.split('-') | first }}"
+
+    - name: Load the {{ deploy_env }} settings
+      ansible.builtin.include_vars:
+        file: "envs/{{ deploy_env }}.yml"
+
+    # A node's own kubeconfig wins over the envs/<env>.yml lookup chain,
+    # which describes paths on THIS machine.
+    - name: Build the cluster arguments
+      ansible.builtin.set_fact:
+        kubeconfig: "{{ node_kubeconfig_path | default(kubeconfig_path | expanduser) }}"
+        kubectl_args: >-
+          {{ ['--kubeconfig', node_kubeconfig_path | default(kubeconfig_path | expanduser)]
+             + (['--context', kube_context] if kube_context else []) }}
+        # One state Secret per environment. This suffix is the ONLY thing
+        # keeping the three states apart, so it is derived, never typed.
+        tf_state_suffix: "billing-getway-{{ deploy_env }}"
+
+    - name: Prepare the cluster node
+      when: node_tf_dir is defined
+      ansible.builtin.include_tasks: tasks/node.yml
+
+    - name: Check the kubeconfig and tfvars exist
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ kubeconfig }}"
+        - "{{ tf_dir }}/envs/{{ deploy_env }}.tfvars"
+      register: required_files
+
+    - name: Fail on a missing file
+      ansible.builtin.assert:
+        that: item.stat.exists
+        fail_msg: "{{ item.item }} does not exist."
+        quiet: true
+      loop: "{{ required_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Check terraform and kubectl are installed
+      ansible.builtin.command:
+        argv: ["{{ item }}", version, "{{ '-json' if item == terraform_bin else '--client' }}"]
+      loop: ["{{ terraform_bin }}", "{{ kubectl_bin }}"]
+      changed_when: false
+
+    - name: Read the cluster this run will write to
+      ansible.builtin.command:
+        argv: "{{ [kubectl_bin] + kubectl_args + ['config', 'view', '--minify', '-o', item] }}"
+      loop:
+        - "jsonpath={.contexts[0].name}"
+        - "jsonpath={.clusters[0].cluster.server}"
+      register: cluster_info
+      changed_when: false
+
+    - name: Reach the cluster
+      ansible.builtin.command:
+        argv: "{{ [kubectl_bin] + kubectl_args + ['get', 'namespace', 'kube-system', '-o', 'name'] }}"
+      changed_when: false
+
+    - name: Show the deploy
+      ansible.builtin.debug:
+        msg:
+          - "environment : {{ deploy_env }}"
+          - "image tag   : {{ image_tag }}"
+          - "state secret: tfstate-default-{{ tf_state_suffix }} (ns {{ tf_state_namespace }})"
+          - "kubeconfig  : {{ kubeconfig }}"
+          - "context     : {{ cluster_info.results[0].stdout }}"
+          - "cluster     : {{ cluster_info.results[1].stdout }}"
+
+    # ENV and kubeconfig are chosen independently, and nothing else would
+    # catch them disagreeing - so look at the cluster line above before
+    # answering.
+    - name: Confirm
+      when: require_confirmation | bool and not auto_approve | bool
+      block:
+        - name: Ask before deploying to {{ deploy_env }}
+          ansible.builtin.pause:
+            prompt: "Deploy {{ image_tag }} to {{ deploy_env }} on {{ cluster_info.results[1].stdout }}? [y/N]"
+          register: confirmation
+
+        - name: Abort unless confirmed
+          ansible.builtin.assert:
+            that: confirmation.user_input | default('') | trim | lower == 'y'
+            fail_msg: aborted
+            quiet: true
+
+    # -------------------------------------------------------------------------
+    # The deploy
+    # -------------------------------------------------------------------------
+
+    - name: Deploy
+      block:
+        - name: Notify deploy started
+          ansible.builtin.include_tasks: tasks/notify.yml
+          vars:
+            message: |-
+              🚢 <b>Deploy Started</b>
+
+              Service: billing-getway-internal
+              Environment: <b>{{ deploy_env }}</b>
+              Image tag: {{ image_tag }}
+
+              Triggered by: {{ triggered_by }}
+
+        # The kubernetes state backend stores a Secret but will not create
+        # the namespace holding it, so the first run per cluster needs this.
+        - name: Ensure the Terraform state namespace exists
+          ansible.builtin.shell:
+            cmd: >-
+              {{ ([kubectl_bin] + kubectl_args) | map('quote') | join(' ') }}
+              create namespace {{ tf_state_namespace | quote }} --dry-run=client -o yaml
+              | {{ ([kubectl_bin] + kubectl_args) | map('quote') | join(' ') }} apply -f -
+          register: state_ns
+          changed_when: "'created' in state_ns.stdout"
+
+        # -reconfigure, not -migrate-state: a different ENV is a DIFFERENT
+        # state that already exists, and Terraform would otherwise offer to
+        # copy one environment's state over another's.
+        - name: Terraform init
+          ansible.builtin.command:
+            chdir: "{{ tf_dir }}"
+            argv: >-
+              {{ [terraform_bin, 'init', '-input=false', '-reconfigure', '-no-color',
+                  '-backend-config=config_path=' ~ kubeconfig,
+                  '-backend-config=secret_suffix=' ~ tf_state_suffix]
+                 + (['-backend-config=config_context=' ~ kube_context] if kube_context else []) }}
+          environment:
+            TF_IN_AUTOMATION: "1"
+          changed_when: false
+
+        - name: Terraform apply
+          ansible.builtin.command:
+            chdir: "{{ tf_dir }}"
+            argv: >-
+              {{ [terraform_bin, 'apply', '-input=false', '-auto-approve', '-no-color',
+                  '-var-file=envs/' ~ deploy_env ~ '.tfvars',
+                  '-var=image_tag=' ~ image_tag,
+                  '-var=kubeconfig_path=' ~ kubeconfig]
+                 + (['-var=kube_context=' ~ kube_context] if kube_context else []) }}
+          environment:
+            TF_IN_AUTOMATION: "1"
+          register: tf_apply
+          changed_when: "'0 added, 0 changed, 0 destroyed' not in tf_apply.stdout"
+
+        - name: Show the Terraform result
+          ansible.builtin.debug:
+            msg: "{{ tf_apply.stdout_lines | select('search', '^(Apply complete|No changes)') | list }}"
+
+        - name: Read the Terraform outputs
+          ansible.builtin.command:
+            chdir: "{{ tf_dir }}"
+            argv: ["{{ terraform_bin }}", output, -json]
+          register: tf_output
+          changed_when: false
+
+        - name: Keep the outputs
+          ansible.builtin.set_fact:
+            tf: "{{ tf | default({}) | combine({item.key: item.value.value}) }}"
+          loop: "{{ tf_output.stdout | from_json | dict2items }}"
+          loop_control:
+            label: "{{ item.key }}"
+
+        # init selected the state by suffix; this proves it was the right one.
+        - name: Check the state belongs to {{ deploy_env }}
+          ansible.builtin.assert:
+            that: tf.environment == deploy_env
+            fail_msg: "Terraform state reports environment '{{ tf.environment }}', expected '{{ deploy_env }}'."
+            quiet: true
+
+        # `terraform apply` returns as soon as the Application spec is
+        # written, before ArgoCD has reacted. For those seconds the
+        # Application still reports Synced/Healthy from the PREVIOUS release,
+        # so waiting on its status directly could pass against stale status.
+        # Wait for the Deployment to carry the new image first.
+        - name: Wait for ArgoCD to apply {{ tf.deployed_image }}
+          ansible.builtin.command:
+            argv: >-
+              {{ [kubectl_bin] + kubectl_args
+                 + ['-n', tf.dest_namespace, 'get', 'deployment', tf.app_name,
+                    '-o', 'jsonpath={.spec.template.spec.containers[0].image}'] }}
+          register: live_image
+          until: live_image.stdout == tf.deployed_image
+          retries: 60
+          delay: 5
+          failed_when: false
+          changed_when: false
+
+        - name: Fail if ArgoCD never applied it
+          ansible.builtin.assert:
+            that: live_image.stdout == tf.deployed_image
+            fail_msg: >-
+              ArgoCD did not apply {{ tf.deployed_image }} within 5m
+              (Deployment is still on {{ live_image.stdout | default('<none>', true) }}).
+            quiet: true
+
+        - name: Wait for the rollout
+          ansible.builtin.command:
+            argv: >-
+              {{ [kubectl_bin] + kubectl_args
+                 + ['-n', tf.dest_namespace, 'rollout', 'status',
+                    'deployment/' ~ tf.app_name, '--timeout=300s'] }}
+          changed_when: false
+
+        - name: Wait for the Application to report Healthy
+          ansible.builtin.command:
+            argv: >-
+              {{ [kubectl_bin] + kubectl_args
+                 + ['-n', tf.argocd_namespace, 'wait', '--timeout=120s',
+                    '--for=jsonpath={.status.health.status}=Healthy',
+                    'application/' ~ tf.app_name] }}
+          changed_when: false
+
+        - name: Deployed
+          ansible.builtin.debug:
+            msg:
+              - "environment : {{ deploy_env }}"
+              - "image       : {{ tf.deployed_image }}"
+              - "replicas    : {{ tf.replicas }}"
+              - "status      : Synced / Healthy"
+
+        - name: Notify success
+          ansible.builtin.include_tasks: tasks/notify.yml
+          vars:
+            message: |-
+              ✅ <b>Deploy Success</b>
+
+              Service: billing-getway-internal
+              Environment: <b>{{ deploy_env }}</b>
+              Image: {{ tf.deployed_image }}
+              Replicas: {{ tf.replicas }}
+              ArgoCD: Synced / Healthy
+
+      rescue:
+        # The fallbacks cover a failure inside `terraform apply` itself,
+        # which leaves the outputs unread.
+        - name: Report what went wrong
+          ansible.builtin.shell:
+            cmd: |
+              k() { {{ ([kubectl_bin] + kubectl_args) | map('quote') | join(' ') }} "$@"; }
+              APP={{ (tf.app_name | default('billing-getway-internal')) | quote }}
+              ARGOCD_NS={{ (tf.argocd_namespace | default('argocd')) | quote }}
+              NS={{ (tf.dest_namespace | default('billing-gateway')) | quote }}
+
+              echo "--- application ({{ deploy_env }}) ---"
+              k -n "$ARGOCD_NS" get application "$APP" -o wide
+              echo "--- conditions ---"
+              k -n "$ARGOCD_NS" get application "$APP" \
+                -o jsonpath='{range .status.conditions[*]}{.type}: {.message}{"\n"}{end}'
+              echo "--- pods ---"
+              k -n "$NS" get pods -o wide
+              echo "--- recent events ---"
+              k -n "$NS" get events --sort-by=.lastTimestamp | tail -20
+          register: diagnostics
+          changed_when: false
+          failed_when: false
+
+        - name: Show diagnostics
+          ansible.builtin.debug:
+            msg: "{{ diagnostics.stdout_lines + diagnostics.stderr_lines }}"
+
+        - name: Notify failure
+          ansible.builtin.include_tasks: tasks/notify.yml
+          vars:
+            message: |-
+              ❌ <b>Deploy Failed</b>
+
+              Service: billing-getway-internal
+              Environment: <b>{{ deploy_env }}</b>
+              Image tag: {{ image_tag }}
+
+              Failed at: {{ ansible_failed_task.name | default('unknown') }}
+              Triggered by: {{ triggered_by }}
+
+        - name: Fail the run
+          ansible.builtin.fail:
+            msg: "Deploy of {{ image_tag }} to {{ deploy_env }} failed at '{{ ansible_failed_task.name | default('unknown') }}': {{ (ansible_failed_result.stderr_lines | default([]))[-5:] | join(' ') or ansible_failed_result.msg | default('see above') }}"

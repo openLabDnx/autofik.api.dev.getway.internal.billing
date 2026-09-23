@@ -14,3 +14,6 @@ terraform/*.tfstate.*
 terraform/terraform.tfvars
 terraform/*.auto.tfvars
 crash.log
+
+# Ansible: per-host passwords - only secrets.example.yml belongs in git.
+ansible/host_vars/*/secrets.yml

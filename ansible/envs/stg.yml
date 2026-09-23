@@ -1,0 +1,11 @@
+# Staging cluster. Loaded when the image tag starts with `stg-`.
+#
+# Which kubeconfig to use, first match wins:
+#   -e kubeconfig_path=...  >  $KUBECONFIG_STG  >  $KUBECONFIG  >  ~/.kube/config
+kubeconfig_path: "{{ lookup('env', 'KUBECONFIG_STG') or lookup('env', 'KUBECONFIG') or '~/.kube/config' }}"
+
+# Empty means the kubeconfig's current-context.
+kube_context: ""
+
+# Same as CI: stg deploys without a prompt.
+require_confirmation: false

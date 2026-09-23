@@ -59,7 +59,7 @@ spec:
   # Two replicas spread across the worker nodes: the gateway is stateless (it
   # holds no data, it only proxies), so a second copy costs nothing and keeps
   # the API up through a node reboot or a drain.
-  replicas: 2
+  replicas: 4
   selector:
     matchLabels:
       app: billing-getway-internal
@@ -152,8 +152,11 @@ metadata:
   namespace: billing-gateway
   labels:
     app: billing-getway-internal
+  annotations:
+    # Explicitly request a specific static IP from your MetalLB pool
+    metallb.universe.tf/loadBalancerIPs: "192.168.1.250" 
 spec:
-  type: ClusterIP
+  type: LoadBalancer
   selector:
     app: billing-getway-internal
   ports:
@@ -165,6 +168,7 @@ spec:
       protocol: TCP
       port: 50055
       targetPort: grpc
+
 ---
 # Keeps at least one gateway pod serving while a node is drained (an upgrade,
 # a reboot, `kubectl drain`). Without this the scheduler is free to evict both

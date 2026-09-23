@@ -23,7 +23,7 @@ DASH_USER ?= admin
 APISIX_ADMIN_KEY_FILE ?= ../../api/ansible/.secrets/apisix_admin_key
 APISIX_ADMIN_KEY ?= $(shell [ -f "$(APISIX_ADMIN_KEY_FILE)" ] && tr -d "[:space:]" < "$(APISIX_ADMIN_KEY_FILE)")
 
-.PHONY: help namespace secret fix-secret deploy all undeploy restart status logs port-forward routes routes-delete routes-dashboard verify tf-init tf-plan tf-apply tf-show tf-state-namespace
+.PHONY: help namespace secret fix-secret deploy all undeploy restart status logs port-forward routes routes-delete routes-dashboard verify tf-init tf-plan tf-apply tf-show tf-state-namespace ansible-deploy ansible-local ansible-ping
 
 help:
 	@echo "namespace     create the $(NAMESPACE) namespace (idempotent)"
@@ -48,6 +48,11 @@ help:
 	@echo "tf-show       what is currently pinned in ENV"
 	@echo ""
 	@echo "  make tf-init ENV=prod && make tf-apply ENV=prod IMAGE_TAG=prod-1.2.3"
+	@echo ""
+	@echo "Ansible (the whole CI deploy in one command - ENV comes from the tag):"
+	@echo "ansible-deploy  init + apply + wait for ArgoCD, IMAGE_TAG=<tag> [YES=1]"
+	@echo "ansible-local   kubectl-only deploy to the local cluster, [IMAGE_TAG=<tag>]"
+	@echo "ansible-ping    check SSH + sudo to the cluster nodes in ansible/inventory.yml"
 
 # The Deployment consumes this Secret via envFrom, so it must exist before
 # the pod can start - apply it first, not after. The namespace has to exist
@@ -215,3 +220,34 @@ tf-apply:
 tf-show:
 	$(require_env)
 	cd $(TF_DIR) && $(TF) output
+
+# ---------------------------------------------------------------------------
+# Ansible - the same deploy as .github/workflows/deploy.yml, run from here
+#
+# One command instead of tf-init + tf-apply + watching ArgoCD by hand. There is
+# no ENV: like CI, the playbook derives it from IMAGE_TAG's channel prefix and
+# picks that environment's kubeconfig from ansible/envs/<env>.yml
+# ($KUBECONFIG_<ENV>, then $KUBECONFIG). prod asks first; YES=1 skips that.
+#
+#   make ansible-deploy IMAGE_TAG=prod-1.2.3
+# ---------------------------------------------------------------------------
+
+ANSIBLE_PLAYBOOK ?= ansible-playbook
+
+# `cd ansible` so its ansible.cfg and inventory are picked up.
+ansible-deploy:
+	@test -n "$(IMAGE_TAG)" || { echo "IMAGE_TAG is required, e.g. make ansible-deploy IMAGE_TAG=dev-1.2.3"; exit 1; }
+	cd ansible && $(ANSIBLE_PLAYBOOK) deploy.yml -e image_tag="$(IMAGE_TAG)" \
+	  $(if $(YES),-e auto_approve=true) $(ANSIBLE_ARGS)
+
+# Local cluster only (kubectl, no Terraform/ArgoCD). IMAGE_TAG is optional.
+#
+#   make ansible-local
+#   make ansible-local IMAGE_TAG=dev-1.2.3
+ansible-local:
+	cd ansible && $(ANSIBLE_PLAYBOOK) local.yml $(if $(IMAGE_TAG),-e image_tag="$(IMAGE_TAG)") $(ANSIBLE_ARGS)
+
+# dev deploys run ON the nprd RKE2 node over SSH (ansible/host_vars/nprd-rke2/),
+# so check that login and sudo work before the first deploy.
+ansible-ping:
+	cd ansible && ansible dev -m ansible.builtin.command -a "id -un" --become $(ANSIBLE_ARGS)

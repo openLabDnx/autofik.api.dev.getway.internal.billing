@@ -1,0 +1,11 @@
+# Development cluster. Loaded when the image tag starts with `dev-`.
+#
+# Which kubeconfig to use, first match wins:
+#   -e kubeconfig_path=...  >  $KUBECONFIG_DEV  >  $KUBECONFIG  >  ~/.kube/config
+kubeconfig_path: "{{ lookup('env', 'KUBECONFIG_DEV') or lookup('env', 'KUBECONFIG') or '~/.kube/config' }}"
+
+# Empty means the kubeconfig's current-context.
+kube_context: ""
+
+# Same as CI: dev deploys without a prompt.
+require_confirmation: false

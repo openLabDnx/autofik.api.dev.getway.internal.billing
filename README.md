@@ -31,6 +31,7 @@ generated from the `google.api.http` options in `billing.proto`.
 | `terraform/` | pins which released image tag and replica count ArgoCD deploys, per environment - see [Releasing](#releasing-tag-build-deploy) |
 | `terraform/envs/` | the dev / stg / prod settings, one `.tfvars` each |
 | `.github/workflows/deploy.yml` | runs that Terraform when the app repo publishes a release |
+| `ansible/` | the same deploy as that workflow, run from your own machine — see [Deploying with Ansible](#deploying-with-ansible) |
 | `Makefile` | the commands below |
 
 ## Deploy
@@ -293,6 +294,60 @@ pick there either, the tag decides.
 
 A rollback is just an older tag of the same channel; the state and the
 Application both record what is live.
+
+### Deploying with Ansible
+
+`ansible/deploy.yml` runs the whole CI deploy in one command from any machine
+holding the cluster's kubeconfig. It checks the tag, runs `terraform init` and
+`apply`, waits until ArgoCD has rolled the new image out and reports Healthy,
+and sends the same Telegram messages. If a step fails it prints the
+Application conditions, pods and recent events. Use it when Actions is down,
+or when you want a rollback without clicking through the UI:
+
+```bash
+export KUBECONFIG_PROD=/path/to/prod/rke2.yaml
+
+make ansible-deploy IMAGE_TAG=prod-1.2.3          # asks before touching prod
+make ansible-deploy IMAGE_TAG=prod-1.2.2 YES=1    # rollback, no prompt
+make ansible-deploy IMAGE_TAG=dev-1.2.3           # dev/stg never prompt
+
+# or directly
+cd ansible && ansible-playbook deploy.yml -e image_tag=stg-1.2.3
+```
+
+As in CI, there is no `ENV`: the tag's prefix picks the environment, and
+`ansible/envs/<env>.yml` picks the kubeconfig, first match wins:
+`-e kubeconfig_path=...`, then `$KUBECONFIG_<ENV>`, then `$KUBECONFIG`, then
+`~/.kube/config`. Set `KUBECONFIG_PROD` rather than relying on a shared
+`KUBECONFIG`, so a shell left pointing at dev cannot receive a prod tag. Set
+`kube_context` in the same file if the cluster is not the current context.
+
+#### dev: over SSH on the nprd node
+
+`ansible/inventory.yml` has one group per environment. `stg` and `prod`
+hold `localhost`, as described above. `dev` holds the nprd RKE2 node
+(`nprdroot@185.252.232.71`), because that cluster's API can't be reached
+from outside. For a `dev-*` tag the playbook SSHes into the node, copies
+`terraform/` to `/opt/billing-getway/terraform`, installs the Terraform
+version CI pins if it is missing, and runs the deploy there with sudo
+against `/etc/rancher/rke2/rke2.yaml`. Telegram messages still go out from
+your machine. The settings are in `ansible/host_vars/nprd-rke2/main.yml`.
+
+The password lives in `ansible/host_vars/nprd-rke2/secrets.yml`, which is
+gitignored. Copy `secrets.yml.example` to create it. Password SSH needs
+`sshpass` (`brew install sshpass`). With a key installed
+(`ssh-copy-id nprdroot@185.252.232.71`), keep only `ansible_become_password`.
+
+```bash
+make ansible-ping                         # SSH + sudo work?
+make ansible-deploy IMAGE_TAG=dev-1.2.3   # deploys from the node
+```
+
+Local runs need `ansible-core`, `terraform` (>= 1.9) and `kubectl` on the machine,
+and no Ansible collections. Telegram messages go out only when
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are exported
+(`TELEGRAM_MESSAGE_THREAD_ID` is optional). If they are not set, the
+messages are skipped.
 
 Terraform state is a Secret in each cluster's `terraform-state` namespace, so
 there is no bucket to provision; `make tf-init ENV=<env>` creates that

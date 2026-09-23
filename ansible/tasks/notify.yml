@@ -1,0 +1,20 @@
+# Send `message` (HTML) to the deploy Telegram chat - the same messages the
+# GitHub workflow sends. Skipped when the bot token or chat id is unset, and a
+# Telegram outage never fails a deploy.
+- name: Send Telegram message
+  when: telegram_bot_token | length > 0 and telegram_chat_id | length > 0
+  ansible.builtin.uri:
+    url: "{{ telegram_api_url }}/bot{{ telegram_bot_token }}/sendMessage"
+    method: POST
+    body_format: form-urlencoded
+    body: >-
+      {{ {'chat_id': telegram_chat_id, 'parse_mode': 'HTML', 'text': message}
+         | combine({'message_thread_id': telegram_thread_id} if telegram_thread_id else {}) }}
+    timeout: 10
+  # The URL carries the bot token.
+  no_log: true
+  failed_when: false
+  # From this machine, where the token was read, even when the deploy runs
+  # on a cluster node - and without that node's sudo.
+  delegate_to: localhost
+  become: false

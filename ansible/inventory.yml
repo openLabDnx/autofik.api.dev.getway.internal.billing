@@ -1,0 +1,27 @@
+# One group per environment, named like the image tag's channel prefix -
+# deploy.yml runs on whichever group the tag picks.
+#
+#   localhost  terraform and kubectl run on this machine and reach the
+#              cluster through its kubeconfig, as the GitHub runner does
+#              (envs/<env>.yml picks which one).
+#   a node     the deploy runs ON that cluster node over SSH, using its own
+#              RKE2 kubeconfig - for a cluster whose API is not reachable
+#              from here. Its settings are in host_vars/<node>/.
+all:
+  hosts:
+    localhost:
+      ansible_connection: local
+      ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+  children:
+    dev:
+      hosts:
+        nprd-rke2:
+          ansible_host: 185.252.232.71
+          ansible_user: nprdroot
+    stg:
+      hosts:
+        localhost:
+    prod:
+      hosts:
+        localhost:

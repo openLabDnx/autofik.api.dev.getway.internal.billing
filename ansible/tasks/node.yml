@@ -1,0 +1,68 @@
+# Get a cluster node ready to run the deploy itself: this repo's Terraform
+# config copied over, and the Terraform binary CI pins. kubectl and the
+# kubeconfig come with RKE2, so they are only checked, by deploy.yml.
+#
+# Only the committed Terraform files are copied - never terraform/.terraform
+# or a local state - and init runs on the node with -reconfigure every time,
+# so what is on the node is always this checkout.
+- name: Create the Terraform directory on the node
+  ansible.builtin.file:
+    path: "{{ tf_dir }}/envs"
+    state: directory
+    mode: "0755"
+
+- name: Copy the Terraform config to the node
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ tf_dir }}/{{ item | relpath(tf_src_dir) }}"
+    mode: "0644"
+  loop: >-
+    {{ query('fileglob', tf_src_dir ~ '/*.tf')
+       + query('fileglob', tf_src_dir ~ '/envs/*.tfvars')
+       + [tf_src_dir ~ '/.terraform.lock.hcl'] }}
+  loop_control:
+    label: "{{ item | relpath(tf_src_dir) }}"
+
+- name: Read the node's Terraform version
+  ansible.builtin.command:
+    argv: ["{{ terraform_bin }}", version, -json]
+  register: node_tf_version
+  changed_when: false
+  failed_when: false
+
+- name: Install Terraform {{ node_terraform_version }}
+  when: >-
+    node_tf_version.rc != 0
+    or (node_tf_version.stdout | from_json).terraform_version != node_terraform_version
+  block:
+    - name: Read the node's architecture
+      ansible.builtin.command:
+        argv: [uname, -m]
+      register: node_arch
+      changed_when: false
+
+    - name: Download Terraform
+      ansible.builtin.get_url:
+        url: >-
+          https://releases.hashicorp.com/terraform/{{ node_terraform_version }}/terraform_{{
+          node_terraform_version }}_linux_{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[node_arch.stdout] }}.zip
+        dest: /tmp/terraform_{{ node_terraform_version }}.zip
+        mode: "0644"
+
+    # unarchive would need unzip on the node; the Python Ansible already
+    # runs there can extract a zip on its own.
+    - name: Unpack Terraform
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_facts.discovered_interpreter_python | default('python3') }}"
+          - -m
+          - zipfile
+          - -e
+          - /tmp/terraform_{{ node_terraform_version }}.zip
+          - "{{ terraform_bin | dirname }}"
+      changed_when: true
+
+    - name: Make Terraform executable
+      ansible.builtin.file:
+        path: "{{ terraform_bin }}"
+        mode: "0755"

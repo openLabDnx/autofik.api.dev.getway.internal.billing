@@ -1,0 +1,160 @@
+# Deploy straight to a local cluster with kubectl - no Terraform, no ArgoCD.
+#
+# The local Talos cluster has no ArgoCD, so the release flow in deploy.yml
+# (Terraform writes an ArgoCD Application) cannot run there. This applies the
+# same kustomization `make deploy` does, plus the Secret, and waits for the
+# rollout:
+#
+#   cd ansible
+#   ansible-playbook local.yml
+#   ansible-playbook local.yml -e image_tag=dev-1.2.3     # pin an image
+#   ansible-playbook local.yml -e kube_context=other-ctx
+#
+# or `make ansible-local [IMAGE_TAG=...]` from the repo root.
+#
+# It refuses to run unless the kubeconfig context is in local_contexts, so a
+# shell left pointing at a real cluster cannot be deployed to by accident -
+# and on a real cluster ArgoCD's selfHeal would revert this anyway.
+- name: Deploy billing-getway to a local cluster
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    repo_root: "{{ playbook_dir | dirname }}"
+    app_namespace: billing-gateway
+    app_name: billing-getway-internal
+    image_repository: autofikbyslaap/dev.api.billing.getway
+    # Empty keeps the image in billing-getway.yml (:master, pulled Always).
+    image_tag: ""
+
+    kubectl_bin: kubectl
+    kubeconfig_path: "{{ lookup('env', 'KUBECONFIG') or '~/.kube/config' }}"
+    # Empty means the kubeconfig's current-context.
+    kube_context: ""
+    local_contexts: [admin@talos-default]
+
+    kubectl_args: >-
+      {{ ['--kubeconfig', kubeconfig_path | expanduser]
+         + (['--context', kube_context] if kube_context else []) }}
+
+  tasks:
+    - name: Read the target context and server
+      ansible.builtin.command:
+        argv: "{{ [kubectl_bin] + kubectl_args + ['config', 'view', '--minify', '-o', item] }}"
+      loop:
+        - "jsonpath={.contexts[0].name}"
+        - "jsonpath={.clusters[0].cluster.server}"
+      register: cluster_info
+      changed_when: false
+
+    - name: Refuse a non-local cluster
+      ansible.builtin.assert:
+        that: cluster_info.results[0].stdout in local_contexts
+        fail_msg: >-
+          Context '{{ cluster_info.results[0].stdout }}' is not a local cluster
+          ({{ local_contexts | join(', ') }}). Use deploy.yml for dev/stg/prod,
+          or pass -e '{"local_contexts": ["{{ cluster_info.results[0].stdout }}"]}'.
+        quiet: true
+
+    - name: Check secret.yml exists
+      ansible.builtin.stat:
+        path: "{{ repo_root }}/secret.yml"
+      register: secret_file
+
+    - name: Fail without secret.yml
+      ansible.builtin.assert:
+        that: secret_file.stat.exists
+        fail_msg: "secret.yml not found - cp secret.example.yml secret.yml and fill it in."
+        quiet: true
+
+    - name: Show the deploy
+      ansible.builtin.debug:
+        msg:
+          - "context : {{ cluster_info.results[0].stdout }}"
+          - "cluster : {{ cluster_info.results[1].stdout }}"
+          - "image   : {{ (image_repository ~ ':' ~ image_tag) if image_tag else 'as in billing-getway.yml' }}"
+
+    - name: Deploy
+      block:
+        # The Deployment reads the Secret through envFrom, so the namespace
+        # and Secret go first or the pods stick in CreateContainerConfigError.
+        - name: Ensure the namespace exists
+          ansible.builtin.shell:
+            cmd: >-
+              {{ ([kubectl_bin] + kubectl_args) | map('quote') | join(' ') }}
+              create namespace {{ app_namespace | quote }} --dry-run=client -o yaml
+              | {{ ([kubectl_bin] + kubectl_args) | map('quote') | join(' ') }} apply -f -
+          register: ns
+          changed_when: "'created' in ns.stdout"
+
+        - name: Apply the Secret
+          ansible.builtin.command:
+            argv: "{{ [kubectl_bin] + kubectl_args + ['apply', '-f', repo_root ~ '/secret.yml'] }}"
+          register: secret_apply
+          changed_when: "'unchanged' not in secret_apply.stdout"
+
+        - name: Apply the manifests
+          ansible.builtin.command:
+            argv: "{{ [kubectl_bin] + kubectl_args + ['apply', '-k', repo_root] }}"
+          register: manifests
+          changed_when: manifests.stdout_lines | reject('search', ' unchanged$') | list | length > 0
+
+        - name: Show what changed
+          ansible.builtin.debug:
+            msg: "{{ manifests.stdout_lines }}"
+
+        - name: Pin the image to {{ image_tag }}
+          when: image_tag | length > 0
+          ansible.builtin.command:
+            argv: >-
+              {{ [kubectl_bin] + kubectl_args
+                 + ['-n', app_namespace, 'set', 'image', 'deployment/' ~ app_name,
+                    '*=' ~ image_repository ~ ':' ~ image_tag] }}
+          register: set_image
+          changed_when: set_image.stdout | length > 0
+
+        # With :master nothing in the spec changes between runs, so restart
+        # to make imagePullPolicy: Always actually pull the newest build.
+        - name: Restart to re-pull the moving tag
+          when: image_tag | length == 0 and not (manifests is changed)
+          ansible.builtin.command:
+            argv: "{{ [kubectl_bin] + kubectl_args + ['-n', app_namespace, 'rollout', 'restart', 'deployment/' ~ app_name] }}"
+          changed_when: true
+
+        - name: Wait for the rollout
+          ansible.builtin.command:
+            argv: >-
+              {{ [kubectl_bin] + kubectl_args
+                 + ['-n', app_namespace, 'rollout', 'status', 'deployment/' ~ app_name, '--timeout=180s'] }}
+          changed_when: false
+
+        - name: Read the pods and service
+          ansible.builtin.command:
+            argv: "{{ [kubectl_bin] + kubectl_args + ['-n', app_namespace, 'get', 'pods,svc', '-l', 'app=' ~ app_name, '-o', 'wide'] }}"
+          register: status
+          changed_when: false
+
+        - name: Deployed
+          ansible.builtin.debug:
+            msg: "{{ status.stdout_lines }}"
+
+      rescue:
+        - name: Report what went wrong
+          ansible.builtin.shell:
+            cmd: |
+              k() { {{ ([kubectl_bin] + kubectl_args) | map('quote') | join(' ') }} "$@"; }
+              echo "--- pods ---"
+              k -n {{ app_namespace | quote }} get pods -o wide
+              echo "--- recent events ---"
+              k -n {{ app_namespace | quote }} get events --sort-by=.lastTimestamp | tail -20
+          register: diagnostics
+          changed_when: false
+          failed_when: false
+
+        - name: Show diagnostics
+          ansible.builtin.debug:
+            msg: "{{ diagnostics.stdout_lines + diagnostics.stderr_lines }}"
+
+        - name: Fail the run
+          ansible.builtin.fail:
+            msg: "Local deploy failed at '{{ ansible_failed_task.name | default('unknown') }}'."
