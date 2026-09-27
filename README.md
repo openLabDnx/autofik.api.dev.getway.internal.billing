@@ -363,6 +363,12 @@ make ansible-local TARGET=nktr-master                      # :master, as in bill
 make ansible-local TARGET=nktr-master IMAGE_TAG=dev-1.0.1  # pin a release
 ```
 
+From outside, the API is `https://api.master.autofik.com` (`make verify`).
+The cluster's Cloudflare tunnel sends that hostname straight to
+`apisix-gateway`. The rule lives in the `cloudflare/cloudflared-config`
+ConfigMap on the cluster, not in this repo.
+`https://apisix.master.autofik.com` is only the APISIX dashboard.
+
 `local.yml` only accepts hosts in the inventory's `local` group. It also
 refuses any cluster that has an ArgoCD Application named
 `billing-getway-internal`, because selfHeal would revert a kubectl deploy.

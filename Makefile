@@ -11,7 +11,10 @@ KUBECTL ?= kubectl
 NAMESPACE ?= billing-gateway
 APISIX_NAMESPACE ?= apisix
 APISIX_ADMIN_PORT ?= 9180
-APISIX_HOSTNAME ?= apisix.master.autofik.com
+# The public hostname of the APISIX *gateway*, used by `verify`. Not
+# apisix.master.autofik.com: that one serves the dashboard, which answers 200
+# with its own HTML for any path and would make `verify` pass for nothing.
+APISIX_HOSTNAME ?= api.master.autofik.com
 
 # The published APISIX dashboard, used by `routes-dashboard`. The dashboard
 # login is `admin` - not `apisix`, which is only the Kubernetes namespace.
