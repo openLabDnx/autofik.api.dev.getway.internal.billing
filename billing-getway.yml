@@ -59,7 +59,7 @@ spec:
   # Two replicas spread across the worker nodes: the gateway is stateless (it
   # holds no data, it only proxies), so a second copy costs nothing and keeps
   # the API up through a node reboot or a drain.
-  replicas: 4
+  replicas: 2
   selector:
     matchLabels:
       app: billing-getway-internal
