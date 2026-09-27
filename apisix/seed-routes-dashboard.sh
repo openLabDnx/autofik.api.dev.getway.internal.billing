@@ -32,6 +32,7 @@ UPSTREAM_NODE="${UPSTREAM_NODE:-billing-getway-internal.billing-gateway.svc.clus
 ADMIN_ALLOW_CIDRS="${ADMIN_ALLOW_CIDRS:-}"
 
 UPSTREAM_ID="billing-getway-internal"
+SERVICE_ID="billing-getway-internal"
 ROUTE_MOBILE_ID="billing-getway-mobile"
 ROUTE_ADMIN_ID="billing-getway-admin"
 
@@ -119,9 +120,11 @@ call() {
 
 if [ "$MODE" = "--delete" ]; then
   echo "Removing billing gateway routes from ${DASH_URL}"
-  # Routes first: an upstream still referenced by a route cannot be deleted.
+  # Routes, then the service they use, then its upstream: APISIX refuses to
+  # delete anything still referenced.
   call DELETE "/apisix/admin/routes/${ROUTE_ADMIN_ID}"
   call DELETE "/apisix/admin/routes/${ROUTE_MOBILE_ID}"
+  call DELETE "/apisix/admin/services/${SERVICE_ID}"
   call DELETE "/apisix/admin/upstreams/${UPSTREAM_ID}"
   echo "Done."
   exit 0
@@ -144,6 +147,20 @@ call PUT "/apisix/admin/upstreams/${UPSTREAM_ID}" "$(cat <<EOF
 EOF
 )"
 
+# ---------------------------------------------------------------------------
+# Service: groups both routes under one object that owns the upstream, so the
+# dashboard's Service page shows the gateway and lists its routes.
+# ---------------------------------------------------------------------------
+call PUT "/apisix/admin/services/${SERVICE_ID}" "$(cat <<EOF
+{
+  "id": "${SERVICE_ID}",
+  "name": "billing-getway-internal",
+  "desc": "autofik.dev.api.billing.getway.internal",
+  "upstream_id": "${UPSTREAM_ID}"
+}
+EOF
+)"
+
 call PUT "/apisix/admin/routes/${ROUTE_MOBILE_ID}" "$(cat <<EOF
 {
   "id": "${ROUTE_MOBILE_ID}",
@@ -153,7 +170,7 @@ call PUT "/apisix/admin/routes/${ROUTE_MOBILE_ID}" "$(cat <<EOF
   "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
   "priority": 0,
   "status": 1,
-  "upstream_id": "${UPSTREAM_ID}",
+  "service_id": "${SERVICE_ID}",
   "plugins": {
     "cors": {
       "allow_origins": "*",
@@ -203,7 +220,7 @@ call PUT "/apisix/admin/routes/${ROUTE_ADMIN_ID}" "$(cat <<EOF
   "methods": ["GET", "POST", "OPTIONS"],
   "priority": 10,
   "status": 1,
-  "upstream_id": "${UPSTREAM_ID}",
+  "service_id": "${SERVICE_ID}",
   "plugins": ${admin_plugins}
 }
 EOF

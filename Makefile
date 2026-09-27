@@ -51,8 +51,8 @@ help:
 	@echo ""
 	@echo "Ansible (the whole CI deploy in one command - ENV comes from the tag):"
 	@echo "ansible-deploy  init + apply + wait for ArgoCD, IMAGE_TAG=<tag> [YES=1]"
-	@echo "ansible-local   kubectl-only deploy to the local cluster, [IMAGE_TAG=<tag>]"
-	@echo "ansible-ping    check SSH + sudo to the cluster nodes in ansible/inventory.yml"
+	@echo "ansible-local   kubectl-only deploy, [TARGET=nktr-master] [IMAGE_TAG=<tag>]"
+	@echo "ansible-ping    check SSH + sudo to a cluster node, [HOSTS=nktr-master] (default dev)"
 
 # The Deployment consumes this Secret via envFrom, so it must exist before
 # the pod can start - apply it first, not after. The namespace has to exist
@@ -240,14 +240,21 @@ ansible-deploy:
 	cd ansible && $(ANSIBLE_PLAYBOOK) deploy.yml -e image_tag="$(IMAGE_TAG)" \
 	  $(if $(YES),-e auto_approve=true) $(ANSIBLE_ARGS)
 
-# Local cluster only (kubectl, no Terraform/ArgoCD). IMAGE_TAG is optional.
+# kubectl only, no Terraform/ArgoCD, to a host in the inventory's `local`
+# group: the local cluster by default, or TARGET=nktr-master over SSH on that
+# node. IMAGE_TAG is optional.
 #
 #   make ansible-local
-#   make ansible-local IMAGE_TAG=dev-1.2.3
+#   make ansible-local TARGET=nktr-master
+#   make ansible-local TARGET=nktr-master IMAGE_TAG=dev-1.2.3
 ansible-local:
-	cd ansible && $(ANSIBLE_PLAYBOOK) local.yml $(if $(IMAGE_TAG),-e image_tag="$(IMAGE_TAG)") $(ANSIBLE_ARGS)
+	cd ansible && $(ANSIBLE_PLAYBOOK) local.yml $(if $(TARGET),-e target="$(TARGET)") \
+	  $(if $(IMAGE_TAG),-e image_tag="$(IMAGE_TAG)") $(ANSIBLE_ARGS)
 
-# dev deploys run ON the nprd RKE2 node over SSH (ansible/host_vars/nprd-rke2/),
-# so check that login and sudo work before the first deploy.
+# Deploys to a node run ON it over SSH (ansible/host_vars/<node>/), so check
+# that login and sudo work before the first one. HOSTS defaults to dev, the
+# nprd RKE2 node; HOSTS=nktr-master checks that one.
+HOSTS ?= dev
+
 ansible-ping:
-	cd ansible && ansible dev -m ansible.builtin.command -a "id -un" --become $(ANSIBLE_ARGS)
+	cd ansible && ansible $(HOSTS) -m ansible.builtin.command -a "id -un" --become $(ANSIBLE_ARGS)

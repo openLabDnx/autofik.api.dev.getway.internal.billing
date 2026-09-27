@@ -1,23 +1,51 @@
-# Deploy straight to a local cluster with kubectl - no Terraform, no ArgoCD.
+# Deploy straight to a cluster with kubectl - no Terraform, no ArgoCD.
 #
-# The local Talos cluster has no ArgoCD, so the release flow in deploy.yml
-# (Terraform writes an ArgoCD Application) cannot run there. This applies the
-# same kustomization `make deploy` does, plus the Secret, and waits for the
-# rollout:
+# For clusters outside the dev/stg/prod release flow in deploy.yml (Terraform
+# writes an ArgoCD Application): the local Talos cluster, which has no ArgoCD,
+# and nktr-master, which runs one but has no Application for this service.
+# This applies the same kustomization `make deploy` does, plus the Secret, and
+# waits for the rollout:
 #
 #   cd ansible
 #   ansible-playbook local.yml
+#   ansible-playbook local.yml -e target=nktr-master      # over SSH on that node
 #   ansible-playbook local.yml -e image_tag=dev-1.2.3     # pin an image
 #   ansible-playbook local.yml -e kube_context=other-ctx
 #
-# or `make ansible-local [IMAGE_TAG=...]` from the repo root.
+# or `make ansible-local [TARGET=nktr-master] [IMAGE_TAG=...]` from the repo root.
 #
-# It refuses to run unless the kubeconfig context is in local_contexts, so a
-# shell left pointing at a real cluster cannot be deployed to by accident -
-# and on a real cluster ArgoCD's selfHeal would revert this anyway.
-- name: Deploy billing-getway to a local cluster
+# WHERE IT RUNS: `target` (default localhost) must be in inventory.yml's
+# `local` group. On localhost it refuses unless the kubeconfig context is in
+# local_contexts, so a shell left pointing at a real cluster cannot be
+# deployed to by accident. On a cluster node it runs kubectl ON the node
+# against its own RKE2 kubeconfig (host_vars/<node>/), so the host is what
+# picks the cluster.
+#
+# Either way it refuses a cluster where an ArgoCD Application already owns
+# the workload - selfHeal would revert this within ~3 minutes.
+
+# The deploy play targets whichever host `target` names, and a name that
+# matches no host is silently skipped - so it is checked here first, where a
+# bad one fails the run instead.
+- name: Check the target
   hosts: localhost
   gather_facts: false
+
+  tasks:
+    - name: Require a host from the local group
+      ansible.builtin.assert:
+        that: target | default('localhost') in groups['local'] | default([])
+        fail_msg: >-
+          '{{ target | default('localhost') }}' is not in inventory.yml's
+          `local` group ({{ groups['local'] | default([]) | join(', ') }}).
+          Use deploy.yml for dev/stg/prod.
+        quiet: true
+
+- name: Deploy billing-getway with kubectl
+  hosts: "{{ target | default('localhost') }}"
+  gather_facts: false
+  # Cluster nodes set node_become: the RKE2 kubeconfig is root-only.
+  become: "{{ node_become | default(false) }}"
 
   vars:
     repo_root: "{{ playbook_dir | dirname }}"
@@ -27,8 +55,12 @@
     # Empty keeps the image in billing-getway.yml (:master, pulled Always).
     image_tag: ""
 
-    kubectl_bin: kubectl
-    kubeconfig_path: "{{ lookup('env', 'KUBECONFIG') or '~/.kube/config' }}"
+    # The node_* settings come from host_vars for a host that is a cluster
+    # node; play vars would override host_vars, hence the indirection.
+    kubectl_bin: "{{ node_kubectl_bin | default('kubectl') }}"
+    kubeconfig_path: "{{ node_kubeconfig_path | default(lookup('env', 'KUBECONFIG') or '~/.kube/config') }}"
+    # Where `apply -k` reads from. A node gets a copy of the kustomization.
+    manifest_dir: "{{ node_manifest_dir | default(repo_root) }}"
     # Empty means the kubeconfig's current-context.
     kube_context: ""
     local_contexts: [admin@talos-default]
@@ -47,7 +79,9 @@
       register: cluster_info
       changed_when: false
 
+    # A node's kubeconfig can only point at its own cluster.
     - name: Refuse a non-local cluster
+      when: node_kubeconfig_path is not defined
       ansible.builtin.assert:
         that: cluster_info.results[0].stdout in local_contexts
         fail_msg: >-
@@ -56,20 +90,37 @@
           or pass -e '{"local_contexts": ["{{ cluster_info.results[0].stdout }}"]}'.
         quiet: true
 
-    - name: Check secret.yml exists
-      ansible.builtin.stat:
-        path: "{{ repo_root }}/secret.yml"
-      register: secret_file
+    # A cluster without ArgoCD has no such resource type, which is fine; any
+    # other error (an unreachable API) fails here.
+    - name: Look for an ArgoCD Application named {{ app_name }}
+      ansible.builtin.command:
+        argv: >-
+          {{ [kubectl_bin] + kubectl_args
+             + ['get', 'applications.argoproj.io', '-A', '-o', 'name',
+                '--field-selector', 'metadata.name=' ~ app_name] }}
+      register: argocd_app
+      changed_when: false
+      failed_when: argocd_app.rc != 0 and 'resource type' not in argocd_app.stderr
 
+    - name: Refuse a cluster where ArgoCD owns the workload
+      ansible.builtin.assert:
+        that: argocd_app.stdout | length == 0
+        fail_msg: >-
+          {{ argocd_app.stdout }} manages {{ app_name }} on this cluster, and
+          its selfHeal would revert a kubectl deploy. Use deploy.yml.
+        quiet: true
+
+    # Tested here, where the file is, even when the deploy runs on a node.
     - name: Fail without secret.yml
       ansible.builtin.assert:
-        that: secret_file.stat.exists
+        that: (repo_root ~ '/secret.yml') is file
         fail_msg: "secret.yml not found - cp secret.example.yml secret.yml and fill it in."
         quiet: true
 
     - name: Show the deploy
       ansible.builtin.debug:
         msg:
+          - "host    : {{ inventory_hostname }}"
           - "context : {{ cluster_info.results[0].stdout }}"
           - "cluster : {{ cluster_info.results[1].stdout }}"
           - "image   : {{ (image_repository ~ ':' ~ image_tag) if image_tag else 'as in billing-getway.yml' }}"
@@ -87,15 +138,36 @@
           register: ns
           changed_when: "'created' in ns.stdout"
 
+        # Over stdin, so the API keys are never written to a node's disk.
         - name: Apply the Secret
           ansible.builtin.command:
-            argv: "{{ [kubectl_bin] + kubectl_args + ['apply', '-f', repo_root ~ '/secret.yml'] }}"
+            argv: "{{ [kubectl_bin] + kubectl_args + ['apply', '-f', '-'] }}"
+            stdin: "{{ lookup('ansible.builtin.file', repo_root ~ '/secret.yml') }}"
           register: secret_apply
           changed_when: "'unchanged' not in secret_apply.stdout"
 
+        # Exactly what kustomization.yaml lists, read from it, so a resource
+        # added there is never left behind on the node.
+        - name: Create the manifest directory on the node
+          when: node_manifest_dir is defined
+          ansible.builtin.file:
+            path: "{{ manifest_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Copy the kustomization to the node
+          when: node_manifest_dir is defined
+          ansible.builtin.copy:
+            src: "{{ repo_root }}/{{ item }}"
+            dest: "{{ manifest_dir }}/{{ item }}"
+            mode: "0644"
+          loop: >-
+            {{ ['kustomization.yaml']
+               + (lookup('ansible.builtin.file', repo_root ~ '/kustomization.yaml') | from_yaml).resources }}
+
         - name: Apply the manifests
           ansible.builtin.command:
-            argv: "{{ [kubectl_bin] + kubectl_args + ['apply', '-k', repo_root] }}"
+            argv: "{{ [kubectl_bin] + kubectl_args + ['apply', '-k', manifest_dir] }}"
           register: manifests
           changed_when: manifests.stdout_lines | reject('search', ' unchanged$') | list | length > 0
 

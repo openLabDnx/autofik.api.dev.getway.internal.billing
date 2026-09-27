@@ -1,0 +1,21 @@
+# The RKE2 manager node of the *.master.autofik.com cluster (manager, worker1
+# and worker2 on 192.168.4.0/24). local.yml SSHes in as vongjx and runs
+# kubectl here, with sudo, against the node's own RKE2 kubeconfig.
+#
+# The SSH and sudo password is in secrets.yml next to this file, which is
+# gitignored - copy secrets.yml.example to create it. With an SSH key
+# installed (ssh-copy-id vongjx@192.168.4.33) only the sudo password is
+# needed.
+
+# Accept the host key on first contact: with password auth there is no
+# terminal to answer the "are you sure" prompt.
+ansible_ssh_common_args: -o StrictHostKeyChecking=accept-new
+
+node_become: true
+
+# Written by RKE2. Its `server:` is 127.0.0.1, which is right here.
+node_kubeconfig_path: /etc/rancher/rke2/rke2.yaml
+node_kubectl_bin: /var/lib/rancher/rke2/bin/kubectl
+
+# Where local.yml copies the kustomization on every run.
+node_manifest_dir: /opt/billing-getway/manifests

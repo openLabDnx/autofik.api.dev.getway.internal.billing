@@ -55,6 +55,16 @@ metadata:
   namespace: billing-gateway
   labels:
     app: billing-getway-internal
+    # Opt in to the cluster's Kyverno policy onelab-autoscale-opt-in, which
+    # generates and keeps in sync an HPA of the same name from the
+    # annotations below. A cluster without that policy ignores the label.
+    onelab.io/autoscale: "true"
+  annotations:
+    # min 2 keeps the PodDisruptionBudget below meaningful; the HPA scales on
+    # CPU against the 50m request.
+    onelab.io/hpa-min: "2"
+    onelab.io/hpa-max: "4"
+    onelab.io/hpa-cpu: "70"
 spec:
   # Two replicas spread across the worker nodes: the gateway is stateless (it
   # holds no data, it only proxies), so a second copy costs nothing and keeps

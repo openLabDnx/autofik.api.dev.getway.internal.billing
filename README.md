@@ -84,7 +84,7 @@ make verify                              # 200 from /mobile/v1/health through AP
 > APISIX dashboard with no `billing-getway-*` routes is the expected state
 > until you seed them by hand. Seed **after** the Application has synced.
 
-`apisix/seed-routes.sh` writes three objects through the Admin API. APISIX
+`apisix/seed-routes.sh` writes four objects through the Admin API. APISIX
 runs in `traditional` role with etcd as its config provider, so routes are
 etcd entries, not Kubernetes objects — there is no CRD to `kubectl apply`.
 The Admin API is ClusterIP-only on port 9180; `make routes` opens its own
@@ -94,6 +94,7 @@ The Admin API is ClusterIP-only on port 9180; `make routes` opens its own
 | Object | Matches | Notes |
 | --- | --- | --- |
 | upstream `billing-getway-internal` | — | `billing-getway-internal.billing-gateway.svc.cluster.local:8081`, 30s read timeout |
+| service `billing-getway-internal` | — | owns the upstream; both routes point at it, so the dashboard's Service page lists them |
 | route `billing-getway-mobile` | `/mobile/v1/*` | the public surface, `cors` enabled |
 | route `billing-getway-admin` | `/mobile/v1/admin/*`, `/mobile/v1/billings/approve`, `/mobile/v1/billings/reject` | priority 10, optional `ip-restriction` |
 
@@ -151,8 +152,8 @@ make routes APISIX_ADMIN_URL=http://127.0.0.1:9180 \
 
 Setting `APISIX_ADMIN_URL` also skips the automatic port-forward.
 
-`make routes-delete` removes both routes and the upstream (routes first — an
-upstream still referenced by a route cannot be deleted).
+`make routes-delete` removes both routes, the service and the upstream, in
+that order — APISIX refuses to delete anything still referenced.
 
 ## Releasing: tag, build, deploy
 
@@ -342,6 +343,31 @@ gitignored. Copy `secrets.yml.example` to create it. Password SSH needs
 make ansible-ping                         # SSH + sudo work?
 make ansible-deploy IMAGE_TAG=dev-1.2.3   # deploys from the node
 ```
+
+#### nktr-master: kubectl over SSH
+
+`nktr-master` is the RKE2 manager node (`vongjx@192.168.4.33`) of the
+`*.master.autofik.com` cluster. It is not part of dev, stg or prod. That
+cluster runs ArgoCD, but it has no Application for this service, so
+`ansible/local.yml` deploys to it with plain kubectl, the same way
+`make deploy` does. The playbook SSHes into the node and copies the
+kustomization to `/opt/billing-getway/manifests`. It sends `secret.yml`
+over stdin, so the keys never touch the node's disk. Then it runs kubectl
+with sudo against `/etc/rancher/rke2/rke2.yaml`. The settings are in
+`ansible/host_vars/nktr-master/main.yml`, and the password goes in the
+gitignored `secrets.yml` next to it.
+
+```bash
+make ansible-ping HOSTS=nktr-master                        # SSH + sudo work?
+make ansible-local TARGET=nktr-master                      # :master, as in billing-getway.yml
+make ansible-local TARGET=nktr-master IMAGE_TAG=dev-1.0.1  # pin a release
+```
+
+`local.yml` only accepts hosts in the inventory's `local` group. It also
+refuses any cluster that has an ArgoCD Application named
+`billing-getway-internal`, because selfHeal would revert a kubectl deploy.
+If you later bootstrap one with `argocd-application.yaml`, deploy through
+`deploy.yml` from then on.
 
 Local runs need `ansible-core`, `terraform` (>= 1.9) and `kubectl` on the machine,
 and no Ansible collections. Telegram messages go out only when

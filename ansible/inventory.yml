@@ -7,6 +7,9 @@
 #   a node     the deploy runs ON that cluster node over SSH, using its own
 #              RKE2 kubeconfig - for a cluster whose API is not reachable
 #              from here. Its settings are in host_vars/<node>/.
+#
+# `local` is not an environment: it lists the clusters local.yml may deploy
+# to with plain kubectl, outside the release flow.
 all:
   hosts:
     localhost:
@@ -25,3 +28,11 @@ all:
     prod:
       hosts:
         localhost:
+
+    local:
+      hosts:
+        localhost:
+        # RKE2 manager of the *.master.autofik.com cluster.
+        nktr-master:
+          ansible_host: 192.168.4.33
+          ansible_user: vongjx
